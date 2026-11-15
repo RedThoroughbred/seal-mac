@@ -1,0 +1,14 @@
+{
+  "name": "seal",
+  "displayName": "Seal for Mac",
+  "version": "0.1.0",
+  "description": "Lock your Claude Code sessions until your iPhone signs a pass with Face ID, and sign git commits with your phone. Needs the Seal app on the iPhone.",
+  "author": {
+    "name": "Seth Egger",
+    "url": "https://github.com/RedThoroughbred"
+  },
+  "homepage": "https://redthoroughbred.github.io/seal",
+  "repository": "https://github.com/RedThoroughbred/seal-mac",
+  "license": "MIT",
+  "keywords": ["security", "secure-enclave", "face-id", "ssh-signatures", "git-signing", "hooks", "agents", "lock"]
+}

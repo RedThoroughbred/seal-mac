@@ -1,0 +1,16 @@
+{
+  "name": "seal-mac",
+  "description": "Seal for Mac: the Mac side of the Seal iPhone app, a lock for Claude Code sessions and git commit signing.",
+  "owner": {
+    "name": "Seth Egger"
+  },
+  "plugins": [
+    {
+      "name": "seal",
+      "source": "./",
+      "category": "security",
+      "homepage": "https://github.com/RedThoroughbred/seal-mac",
+      "description": "Lock your Claude Code sessions until your iPhone signs a pass with Face ID, and sign git commits with your phone."
+    }
+  ]
+}
