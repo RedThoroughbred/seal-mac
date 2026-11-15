@@ -1,0 +1,10 @@
+#!/bin/sh
+# The Seal lock's door, called by Claude Code before every message and every tool (hooks/hooks.json).
+# While the lock is off there is no lock-on file, and this lets everything go at once without starting
+# Python. While it is on, the lock itself decides (seal-gate hook): 0 goes on, 2 holds. If the lock
+# cannot even start, this exits with another number, and the hook's "onFailure": "block" holds too.
+dir="${SEAL_GATE_DIR:-$HOME/.seal-gate}"
+if [ ! -e "$dir/lock-on" ] && [ ! -L "$dir/lock-on" ]; then
+  exit 0
+fi
+exec python3 "$(dirname "$0")/seal-gate" hook

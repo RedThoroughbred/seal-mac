@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""seal-git-sign: lets git ask the Seal app on a phone for a signature, instead of a key on this Mac.
+
+git calls it the way it calls ssh-keygen:
+
+    seal-git-sign -Y sign -n git -f <key file> [-U] <file to sign>     (git then reads <file to sign>.sig)
+
+What it does with that:
+  1. turns the bytes to sign into one line, a "seal://sign?..." request;
+  2. gets that line to you: in this terminal when you ran git yourself; when an agent ran it, on the
+     clipboard with a notice on the Mac (or in another terminal, where you run: seal-git-sign --answer);
+  3. takes the signature back: pasted here, or copied on the phone and brought by the shared clipboard;
+  4. has the real ssh-keygen check it against the key git is set to use, and only then hands it to git.
+
+It talks to no network. Everything that is not signing (checking signatures) goes to the real ssh-keygen.
+
+Set up one repository (run inside it; the key line is the one the app's Sign page copies as "SSH key"):
+
+    seal-git-sign --setup "ecdsa-sha2-nistp256 AAAA... name"
+    git commit -S -m "..."            (or, to sign every commit there: git config commit.gpgsign true)
+
+--setup changes that repository's own git settings and nothing else: gpg.format, gpg.ssh.program,
+user.signingkey and gpg.ssh.allowedSignersFile (a small file inside its .git folder, so that
+`git log --show-signature` can say "Good"). `seal-git-sign --unset` takes all four back out.
+"""
+import base64
+import json
+import os
+import secrets
+import subprocess
+import sys
+import tempfile
+import time
+
+SSH_KEYGEN = os.environ.get("SEAL_SSH_KEYGEN", "/usr/bin/ssh-keygen")
+FOLDER = os.path.expanduser(os.environ.get("SEAL_SIGN_DIR", "~/.seal-sign"))
+COPY = os.environ.get("SEAL_GATE_COPY", "/usr/bin/pbcopy")
+PASTE = os.environ.get("SEAL_GATE_PASTE", "/usr/bin/pbpaste")
+WAIT_SECONDS = int(os.environ.get("SEAL_SIGN_WAIT", "110"))
+SIZE_LIMIT = 256 * 1024
+BEGIN, END = "-----BEGIN SSH SIGNATURE-----", "-----END SSH SIGNATURE-----"
+
+
+def say(text=""):
+    sys.stderr.write(text + "\n")
+    sys.stderr.flush()
+
+
+def request_line(namespace, message):
+    packed = base64.urlsafe_b64encode(message).decode().rstrip("=")
+    return f"seal://sign?v=1&ns={namespace}&m={packed}"
+
+
+def folder():
+    os.makedirs(FOLDER, mode=0o700, exist_ok=True)
+    os.chmod(FOLDER, 0o700)
+    return FOLDER
+
+
+def fingerprint_of_key_file(path):
+    out = subprocess.run([SSH_KEYGEN, "-l", "-f", path], capture_output=True, text=True)
+    parts = out.stdout.split()
+    return parts[1] if out.returncode == 0 and len(parts) > 1 else None
+
+
+def checked(signature, namespace, message, key_file, quiet=False):
+    """True when ssh-keygen says the signature fits these bytes and was made by the key git is set to use."""
+    with tempfile.NamedTemporaryFile("w", suffix=".sig", delete=False) as handle:
+        handle.write(signature)
+        sig_path = handle.name
+    try:
+        result = subprocess.run(
+            [SSH_KEYGEN, "-Y", "check-novalidate", "-n", namespace, "-s", sig_path],
+            input=message, capture_output=True,
+        )
+        said = (result.stdout + result.stderr).decode(errors="replace")
+        if result.returncode != 0:
+            if not quiet:
+                say("seal-git-sign: that signature does not fit what was to be signed. " + said.strip())
+            return False
+        wanted = fingerprint_of_key_file(key_file)
+        if not wanted or wanted not in said:
+            if not quiet:
+                say(f"seal-git-sign: signed with another key than git is set to use ({wanted}). Not accepted.")
+            return False
+        return True
+    finally:
+        os.unlink(sig_path)
+
+
+def to_clipboard(line):
+    try:
+        subprocess.run([COPY], input=line.encode(), check=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
+
+
+def from_clipboard():
+    try:
+        return subprocess.run([PASTE], capture_output=True, timeout=20).stdout.decode(errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def notify(text):
+    """A notice on the Mac, for when git was run by an agent and nobody watches the terminal."""
+    if os.environ.get("SEAL_SIGN_NOTIFY", "1") == "0":
+        return
+    script = "display notification " + json.dumps(text) + ' with title "Seal"'
+    try:
+        subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def signature_in(text):
+    """One whole signature out of text, however its lines were broken on the way. None when there is none."""
+    end = text.find(END)
+    start = text.rfind(BEGIN, 0, end) if end >= 0 else -1
+    if start < 0:
+        return None
+    packed = "".join(text[start + len(BEGIN):end].split())
+    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+    if not packed or len(packed) > 8192 or not all(letter in letters for letter in packed):
+        return None
+    lines = [packed[index:index + 70] for index in range(0, len(packed), 70)]
+    return "\n".join([BEGIN] + lines + [END]) + "\n"
+
+
+def signature_from(lines):
+    """Picks the signature block out of pasted lines. None when there is no whole block."""
+    block, inside = [], False
+    for line in lines:
+        line = line.strip()
+        if line == BEGIN:
+            block, inside = [line], True
+        elif inside:
+            block.append(line)
+            if line == END:
+                return "\n".join(block) + "\n"
+    return None
+
+
+def read_pasted(stream):
+    lines = []
+    for line in stream:
+        lines.append(line)
+        if line.strip() == END:
+            break
+        if not line.strip() and not lines[:-1]:
+            return None        # an empty first line: the person gave up
+    return signature_from(lines)
+
+
+def show_request(line, out):
+    out.write("\nSeal: a signature is wanted from your phone.\n")
+    out.write("1. Open this line in the Seal app: tap it, or copy it and tap Paste a signing request.\n\n")
+    out.write(line + "\n\n")
+    if out.isatty():
+        # Terminals that allow it put the line on the clipboard of the device you are typing on (OSC 52).
+        out.write("\033]52;c;" + base64.b64encode(line.encode()).decode() + "\a")
+    out.write("2. Sign there, copy the signature, paste it here. (An empty line gives up.)\n")
+    out.flush()
+
+
+def answer():
+    """Run by a person in a terminal: shows the waiting request and takes the pasted signature."""
+    waiting = sorted(name for name in os.listdir(folder()) if name.endswith(".request"))
+    if not waiting:
+        say("seal-git-sign: nothing is waiting for a signature.")
+        return 1
+    name = waiting[0]
+    with open(os.path.join(FOLDER, name)) as handle:
+        line = handle.read().strip()
+    show_request(line, sys.stderr)
+    signature = read_pasted(sys.stdin)
+    if not signature:
+        say("seal-git-sign: no signature was pasted.")
+        return 1
+    reply = os.path.join(FOLDER, name[: -len(".request")] + ".reply")
+    with open(reply + ".part", "w") as handle:
+        handle.write(signature)
+    os.replace(reply + ".part", reply)
+    say("seal-git-sign: handed over. git checks it now.")
+    return 0
+
+
+def sign(namespace, key_file, target):
+    with open(target, "rb") as handle:
+        message = handle.read()
+    if not message or len(message) > SIZE_LIMIT:
+        say("seal-git-sign: nothing to sign, or more than the app takes.")
+        return 1
+    line = request_line(namespace, message)
+
+    signature = None
+    tty = None
+    if os.environ.get("SEAL_SIGN_HERE", "1") != "0" and sys.stderr.isatty():
+        try:
+            tty = open("/dev/tty", "r+")
+        except OSError:
+            tty = None
+    if tty:
+        # A person ran git in this terminal: ask right here.
+        show_request(line, tty)
+        signature = read_pasted(tty)
+        tty.close()
+    else:
+        # git was run by a program (an agent), so nobody is at this terminal. The request goes on the
+        # clipboard, with a notice on the Mac, and stays where `seal-git-sign --answer` finds it. The
+        # signature may come back either way: copied on the phone (the shared clipboard brings it), or
+        # pasted into --answer.
+        name = time.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(4)
+        request = os.path.join(folder(), name + ".request")
+        reply = os.path.join(FOLDER, name + ".reply")
+        with open(request, "w") as handle:
+            handle.write(line + "\n")
+        on_clipboard = to_clipboard(line)
+        notify("A git commit wants your signature. " + ("The request is on the clipboard: " if on_clipboard else "")
+               + "Seal, Sign, Paste a signing request.")
+        say(f"seal-git-sign: waiting up to {WAIT_SECONDS} s for a signature from your phone.")
+        if on_clipboard:
+            say("seal-git-sign: the request is on the clipboard. In the Seal app: Sign, Paste a signing request, Sign with Face ID, Copy the signature.")
+        say("seal-git-sign: or, in another terminal: seal-git-sign --answer")
+        deadline = time.time() + WAIT_SECONDS
+        tried = set()
+        try:
+            while time.time() < deadline and signature is None:
+                if os.path.exists(reply):
+                    with open(reply) as handle:
+                        signature = signature_from(handle.readlines())
+                    break
+                found = signature_in(from_clipboard()) if on_clipboard else None
+                if found is not None and found not in tried:
+                    tried.add(found)
+                    if checked(found, namespace, message, key_file, quiet=True):
+                        signature = found
+                        break
+                time.sleep(0.5)
+        finally:
+            for path in (request, reply):
+                if os.path.exists(path):
+                    os.unlink(path)
+
+    if not signature:
+        say("seal-git-sign: no signature came. Nothing was signed.")
+        return 1
+    if not checked(signature, namespace, message, key_file):
+        return 1
+    with open(target + ".sig", "w") as handle:
+        handle.write(signature)
+    return 0
+
+
+SETTINGS = ("gpg.format", "gpg.ssh.program", "user.signingkey", "gpg.ssh.allowedSignersFile")
+
+
+def git(*arguments):
+    return subprocess.run(["git", *arguments], capture_output=True, text=True)
+
+
+def setup(key_line):
+    """Sets the repository in the current folder to sign through this helper with the given SSH key."""
+    key_line = " ".join(key_line.split())
+    top = git("rev-parse", "--absolute-git-dir")
+    if top.returncode != 0:
+        say("seal-git-sign: run this inside the repository you want to sign in.")
+        return 1
+    with tempfile.NamedTemporaryFile("w", suffix=".pub", delete=False) as handle:
+        handle.write(key_line + "\n")
+        key_path = handle.name
+    try:
+        if not fingerprint_of_key_file(key_path):
+            say("seal-git-sign: that is not an SSH public key line. Copy it from the app's Sign page (Copy SSH key).")
+            return 1
+        print_of_key = fingerprint_of_key_file(key_path)
+    finally:
+        os.unlink(key_path)
+    who = git("config", "user.email").stdout.strip() or "me"
+    allowed = os.path.join(top.stdout.strip(), "seal-allowed-signers")
+    with open(allowed, "w") as handle:
+        handle.write(f'{who} namespaces="git" {key_line}\n')
+    values = ("ssh", os.path.abspath(__file__), "key::" + key_line, allowed)
+    for name, value in zip(SETTINGS, values):
+        if git("config", "--local", name, value).returncode != 0:
+            say(f"seal-git-sign: could not set {name}.")
+            return 1
+    say(f"seal-git-sign: this repository now signs through the Seal app, with the key {print_of_key}.")
+    say("seal-git-sign: sign one commit with `git commit -S`. Undo all of it with `seal-git-sign --unset`.")
+    return 0
+
+
+def unset():
+    top = git("rev-parse", "--absolute-git-dir")
+    if top.returncode != 0:
+        say("seal-git-sign: run this inside the repository.")
+        return 1
+    for name in SETTINGS:
+        git("config", "--local", "--unset", name)
+    allowed = os.path.join(top.stdout.strip(), "seal-allowed-signers")
+    if os.path.exists(allowed):
+        os.unlink(allowed)
+    say("seal-git-sign: this repository's signing settings were taken out again.")
+    return 0
+
+
+def main(arguments):
+    if arguments[:1] == ["--answer"]:
+        return answer()
+    if arguments[:1] == ["--setup"] and len(arguments) == 2:
+        return setup(arguments[1])
+    if arguments[:1] == ["--unset"]:
+        return unset()
+    if arguments[:1] in (["-h"], ["--help"]) or not arguments:
+        say(__doc__)
+        return 0
+    if "-Y" in arguments and arguments[arguments.index("-Y") + 1 : arguments.index("-Y") + 2] == ["sign"]:
+        def after(flag):
+            return arguments[arguments.index(flag) + 1] if flag in arguments[:-1] else None
+        namespace, key_file, target = after("-n"), after("-f"), arguments[-1]
+        if not namespace or not key_file or not os.path.isfile(target):
+            say("seal-git-sign: expected -Y sign -n <namespace> -f <key file> <file to sign>")
+            return 1
+        return sign(namespace, key_file, target)
+    # Checking signatures and the rest is ssh-keygen's own job.
+    os.execv(SSH_KEYGEN, [SSH_KEYGEN] + arguments)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
