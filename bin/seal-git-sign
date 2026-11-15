@@ -27,6 +27,7 @@ import base64
 import json
 import os
 import secrets
+import select
 import subprocess
 import sys
 import tempfile
@@ -153,15 +154,45 @@ def read_pasted(stream):
     return signature_from(lines)
 
 
-def show_request(line, out):
+def show_request(line, out, on_clipboard=False):
     out.write("\nSeal: a signature is wanted from your phone.\n")
-    out.write("1. Open this line in the Seal app: tap it, or copy it and tap Paste a signing request.\n\n")
+    if on_clipboard:
+        out.write("1. The request is on the clipboard. In the Seal app: Sign, Paste a signing request.\n\n")
+    else:
+        out.write("1. Open this line in the Seal app: tap it, or copy it and tap Paste a signing request.\n\n")
     out.write(line + "\n\n")
     if out.isatty():
-        # Terminals that allow it put the line on the clipboard of the device you are typing on (OSC 52).
+        # Terminals that allow it put the line on the clipboard of the device you are typing on (OSC 52),
+        # which is the phone when this terminal is open on it.
         out.write("\033]52;c;" + base64.b64encode(line.encode()).decode() + "\a")
-    out.write("2. Sign there, copy the signature, paste it here. (An empty line gives up.)\n")
+    if on_clipboard:
+        out.write("2. Sign with Face ID, Copy the signature. It is picked up from the clipboard, or paste it here. (An empty line gives up.)\n")
+    else:
+        out.write("2. Sign there, copy the signature, paste it here. (An empty line gives up.)\n")
     out.flush()
+
+
+def wait_here(tty, namespace, message, key_file, on_clipboard):
+    """Waits at the terminal for a pasted signature and, meanwhile, watches the clipboard for one that
+    fits. A pasted one is checked by the caller, as before."""
+    tty, out = tty
+    tried = set()
+    deadline = time.time() + WAIT_SECONDS
+    while time.time() < deadline:
+        ready, _, _ = select.select([tty], [], [], 0.5)
+        if ready:
+            return read_pasted(tty)
+        if on_clipboard:
+            found = signature_in(from_clipboard())
+            if found is not None and found not in tried:
+                tried.add(found)
+                if checked(found, namespace, message, key_file, quiet=True):
+                    out.write("Seal: the signature came by the clipboard.\n")
+                    out.flush()
+                    return found
+    out.write(f"Seal: no signature came in {WAIT_SECONDS} seconds.\n")
+    out.flush()
+    return None
 
 
 def answer():
@@ -196,16 +227,23 @@ def sign(namespace, key_file, target):
 
     signature = None
     tty = None
-    if os.environ.get("SEAL_SIGN_HERE", "1") != "0" and sys.stderr.isatty():
+    # git keeps the helper's standard error to itself, so that never looks like a terminal. Whether a
+    # person is at one is whether this process has a terminal at all: an agent's commands have none.
+    if os.environ.get("SEAL_SIGN_HERE", "1") != "0":
         try:
-            tty = open("/dev/tty", "r+")
+            # Two handles: Python will not open a terminal for reading and writing in one ("r+").
+            tty = (open("/dev/tty", "r"), open("/dev/tty", "w"))
         except OSError:
             tty = None
     if tty:
-        # A person ran git in this terminal: ask right here.
-        show_request(line, tty)
-        signature = read_pasted(tty)
-        tty.close()
+        # A person ran git in this terminal: ask right here. The request also goes on the Mac's
+        # clipboard, and the signature is taken from whichever comes first: pasted here, or copied on
+        # the phone and brought back by the shared clipboard.
+        on_clipboard = to_clipboard(line)
+        show_request(line, tty[1], on_clipboard)
+        signature = wait_here(tty, namespace, message, key_file, on_clipboard)
+        for handle in tty:
+            handle.close()
     else:
         # git was run by a program (an agent), so nobody is at this terminal. The request goes on the
         # clipboard, with a notice on the Mac, and stays where `seal-git-sign --answer` finds it. The

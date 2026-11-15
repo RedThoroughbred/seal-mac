@@ -344,6 +344,70 @@ class GitSigning(SealTestCase):
         self.assertEqual(verdict.returncode, 0, verdict.stderr)
         self.assertIn("Good", verdict.stderr)
 
+    def test_a_commit_run_by_a_person_in_a_terminal_takes_a_pasted_signature(self):
+        import pty
+        import select
+        self.paired()
+        self.slash("git", cwd=self.repo)
+        with open(os.path.join(self.repo, "p.txt"), "w") as handle:
+            handle.write("p\n")
+        self.git("add", "p.txt")
+        child, terminal = pty.fork()
+        if child == 0:
+            os.chdir(self.repo)
+            os.execvpe("git", ["git", "commit", "-q", "-S", "-m", "pasted in a terminal"], self.env)
+        shown, pasted, deadline = b"", False, time.time() + 30
+        while time.time() < deadline:
+            ready, _, _ = select.select([terminal], [], [], 0.2)
+            if ready:
+                try:
+                    piece = os.read(terminal, 4096)
+                except OSError:
+                    break
+                if not piece:
+                    break
+                shown += piece
+            if not pasted and b"paste it here" in shown:
+                _, words = read_request(self.copied())
+                self.copy("the clipboard moved on")          # so only the paste can answer
+                os.write(terminal, self.phone.sign(words, "git").encode())
+                pasted = True
+        _, status = os.waitpid(child, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0, shown.decode(errors="replace"))
+        self.assertNotIn(b"came by the clipboard", shown)
+        self.assertEqual(self.git("verify-commit", "HEAD").returncode, 0)
+
+    def test_a_commit_run_by_a_person_in_a_terminal_takes_the_signature_from_the_clipboard(self):
+        import pty
+        import select
+        self.paired()
+        self.slash("git", cwd=self.repo)
+        with open(os.path.join(self.repo, "t.txt"), "w") as handle:
+            handle.write("t\n")
+        self.git("add", "t.txt")
+        child, terminal = pty.fork()
+        if child == 0:  # in the terminal: the person runs git
+            os.chdir(self.repo)
+            os.execvpe("git", ["git", "commit", "-q", "-S", "-m", "signed in a terminal"], self.env)
+        shown, answered, deadline = b"", False, time.time() + 30
+        while time.time() < deadline:
+            ready, _, _ = select.select([terminal], [], [], 0.2)
+            if ready:
+                try:
+                    piece = os.read(terminal, 4096)
+                except OSError:
+                    break
+                if not piece:
+                    break
+                shown += piece
+            if not answered and "seal://sign?v=1&ns=git" in self.copied():
+                self.answer_waiting_request()   # the phone signs; the signature comes by the clipboard
+                answered = True
+        _, status = os.waitpid(child, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0, shown.decode(errors="replace"))
+        self.assertIn(b"came by the clipboard", shown)
+        self.assertEqual(self.git("verify-commit", "HEAD").returncode, 0)
+
     def test_a_signature_from_another_key_is_not_given_to_git(self):
         self.paired()
         self.slash("git", cwd=self.repo)
