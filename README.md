@@ -45,6 +45,16 @@ While a session is locked, `/seal:status`, `/seal:on`, `/seal:off`, `/seal:drop`
 
 **Away from the Mac,** with Remote Control on your phone: the held message shows the request as one `seal://sign?…` line. Copy it into Seal, sign, and paste the signature back as your next message. That works for a pass and for `/seal:off`.
 
+## Lost your phone?
+
+If the lock is on and the phone's key is gone (a lost phone, or Face ID set up again, which ends the key on purpose), turn the lock off from the Mac's own Terminal, not from Claude Code:
+
+```
+rm ~/.seal-gate/lock-on
+```
+
+Then pair the new key: in Seal, **Sign** page, `Copy SSH key`, and `/seal:pair`. Whoever sits at your Mac can always do this; the lock keeps your agents from being driven from elsewhere, not your Mac from you.
+
 ## Sign git commits
 
 Inside a repository: `/seal:git`. Then `git commit -S`, or `git config commit.gpgsign true` to sign every commit there.
