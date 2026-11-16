@@ -11,7 +11,7 @@ This is the Mac side of [Seal](https://redthoroughbred.github.io/seal), an iPhon
 /plugin install seal@seal-mac
 ```
 
-You need Seal on your iPhone, a Mac with Claude Code, and Python 3 (Claude Code users nearly always have it). The phone and the Mac hand the request and the answer over the shared clipboard: the same Apple Account on both, Handoff on, the phone near the Mac.
+You need Seal on your iPhone, a Mac with Claude Code, and Python 3 (Claude Code users nearly always have it). The phone and the Mac hand the request and the answer over Apple's shared clipboard, so **Handoff has to be on, on both**: the same Apple Account, Wi-Fi and Bluetooth on, the phone near the Mac. iPhone: Settings, General, AirPlay & Continuity, Handoff. Mac: System Settings, General, AirDrop & Handoff. To check: copy a word on the phone, press ⌘V on the Mac, and the word should appear.
 
 ## Pair your phone (once)
 
@@ -26,17 +26,21 @@ The Mac now trusts that one key, and only it.
 /seal:on
 ```
 
-From your next message, every Claude Code session on this Mac takes no message and runs no tool until your phone signs a **pass**:
+From your next message, every Claude Code session on this Mac (the one you typed it in too) takes no message and runs no tool until your phone signs a **pass**:
 
-1. Your message is held, and a request is put on the clipboard.
+1. Your message is held. Claude shows the steps right under it, starting *"Locked. On your phone: …"*, and the request is put on the Mac's clipboard.
 2. On the phone: **Sign**, `Paste a signing request`. It names your Mac and when the pass ends. `Sign with Face ID`, `Copy the signature`.
-3. Send your message again. The pass is good for 30 minutes, for every session on this Mac.
+3. On the Mac: ⌘V into Claude's message box (that paste fetches the signature from the phone) and send. The pass is good for 30 minutes, for every session on this Mac.
+
+If ⌘V gives you the request back instead, the phone's copy didn't reach the Mac: check Handoff, or paste the signature from the phone through Remote Control. The lock also looks on the Mac's clipboard whenever a message comes in, so sending again can work too.
+
+**Stuck?** Every held message ends with the way out: in the Terminal app (not Claude Code), `rm ~/.seal-gate/lock-on` turns the lock off.
 
 | Command | What it does |
 | --- | --- |
 | `/seal:status` | Whether the lock is on, whether a pass is good and until when, which phone key is paired |
 | `/seal:pass 120` | Ask for a longer pass now (30 minutes unless you say, 4 hours at most) |
-| `/seal:drop` | End the pass now: everything locks again |
+| `/seal:drop` | End the pass now: everything locks again (with no pass good it changes nothing, and a request waiting for your phone keeps waiting) |
 | `/seal:off` | Turn the lock off. **This needs your phone too**: a yes signed for exactly "Turn the Seal lock off" |
 | `/seal:pair` | Pair a phone. Refused while the lock is on |
 | `/seal:git` | Sign this repository's commits with your phone |
@@ -44,7 +48,7 @@ From your next message, every Claude Code session on this Mac takes no message a
 
 While a session is locked, `/seal:status`, `/seal:on`, `/seal:drop` and `/seal:lockdown` still go through, typed alone. None of them opens anything or touches the clipboard. `/seal:off` and `/seal:pass` wait for a pass like any message, so nobody who can't sign can swap the request you are about to sign. Claude can't run any of these commands itself, and they ignore whatever a session or a project sets in the environment.
 
-**Away from the Mac,** with Remote Control on your phone: the held message shows the request as one `seal://sign?…` line. Copy it into Seal, sign, and paste the signature back as your next message. That works for a pass, and for `/seal:off` once a pass is good.
+**Away from the Mac,** with Remote Control on your phone: the held message shows the request as one `seal://sign?…` line. Copy it into Seal, sign, and paste the signature into your next message. That works for a pass, and for `/seal:off` once a pass is good. It also works at the Mac when the shared clipboard doesn't.
 
 ## Lock it down
 
