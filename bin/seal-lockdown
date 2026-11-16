@@ -36,6 +36,14 @@ else
   owner="root:wheel"
 fi
 
+strict_key() {
+  # Prints "type base64" from one line, and only when the line holds exactly one key of a kind the phone
+  # makes. Anything else prints nothing (Fable review, finding 1: a second key must never ride along).
+  printf '%s\n' "$1" | /usr/bin/awk '
+    { for (i = 1; i <= NF; i++) if ($i == "ecdsa-sha2-nistp256" || $i == "ssh-ed25519") { t = $i; k = $(i + 1); n++ } }
+    END { if (n == 1 && k ~ /^[A-Za-z0-9+\/]+=*$/) print t " " k }'
+}
+
 confirm() {
   # $1: a public key line. Shows its fingerprint and asks for "yes".
   tmp=$(/usr/bin/mktemp)
@@ -69,25 +77,45 @@ put_key() {
 
 case "${1:-}" in
   install)
-    line=$(/usr/bin/awk '{ for (i = 3; i <= NF; i++) printf "%s%s", $i, (i < NF ? " " : "\n") }' "$home/.seal-gate/allowed_signers" 2>/dev/null || true)
-    if [ -z "$line" ] || ! /usr/bin/grep -q 'seal-pass' "$home/.seal-gate/allowed_signers" 2>/dev/null; then
-      echo "seal-lockdown: no phone key that may sign passes is paired. In Claude Code: /seal:pair first." >&2
+    signers="$home/.seal-gate/allowed_signers"
+    lines=$(/usr/bin/grep -c . "$signers" 2>/dev/null || true)
+    if [ "$lines" != "1" ] || ! /usr/bin/grep -q 'namespaces="[a-z,-]*seal-pass' "$signers"; then
+      echo "seal-lockdown: the paired phone key must be one line that may sign passes ($signers has ${lines:-no} lines). In Claude Code: /seal:pair, then run this again." >&2
       exit 1
     fi
+    line=$(strict_key "$(/bin/cat "$signers")")
+    if [ -z "$line" ]; then
+      echo "seal-lockdown: $signers does not hold exactly one phone key. In Claude Code: /seal:pair, then run this again." >&2
+      exit 1
+    fi
+    echo "The lock's files, to check against the release if you like:"
+    /usr/bin/shasum -a 256 "$here/seal-gate" "$here/seal-lockdown"
     confirm "$line"
+    if [ -n "$owner" ]; then
+      python=$($PY "$here/seal-gate" python-path) || { echo "seal-lockdown: Apple's Python can be changed by someone other than root, so the lock would prove nothing. Nothing was changed." >&2; exit 1; }
+    else
+      python="${SEAL_TEST_PYTHON:-/usr/bin/python3}"
+    fi
+    /bin/rm -f "$root/lockdown.json"   # a half-done install must never look finished
     /bin/mkdir -p "$root"
-    /bin/cp "$here/seal-gate" "$root/seal-gate.part"
-    /bin/chmod 555 "$root/seal-gate.part"
-    if [ -n "$owner" ]; then /usr/sbin/chown "$owner" "$root/seal-gate.part"; fi
-    /bin/mv -f "$root/seal-gate.part" "$root/seal-gate"
+    for file in seal-gate seal-lockdown; do
+      /bin/cp "$here/$file" "$root/$file.part"
+      /bin/chmod 555 "$root/$file.part"
+      if [ -n "$owner" ]; then /usr/sbin/chown "$owner" "$root/$file.part"; fi
+      /bin/mv -f "$root/$file.part" "$root/$file"
+    done
     put_key "$line"
+    printf '%s\n' "$python" > "$root/python-path"
+    /bin/chmod 444 "$root/python-path"
+    if [ -n "$owner" ]; then /usr/sbin/chown "$owner" "$root/python-path" "$root"; fi
+    /bin/chmod 755 "$root"
+    $PY "$root/seal-gate" managed add "$managed" "$root/seal-gate" "$root" "$python"
+    # Last: only now does the plugin's door hand over to the lockdown (Fable review, finding 3).
     printf '{"installed": %s}\n' "$(/bin/date +%s)" > "$root/lockdown.json"
     /bin/chmod 444 "$root/lockdown.json"
-    if [ -n "$owner" ]; then /usr/sbin/chown "$owner" "$root/lockdown.json"; /usr/sbin/chown "$owner" "$root"; fi
-    /bin/chmod 755 "$root"
-    $PY "$root/seal-gate" managed add "$managed" "$root/seal-gate" "$root"
+    if [ -n "$owner" ]; then /usr/sbin/chown "$owner" "$root/lockdown.json"; fi
     echo "Lockdown is on. Every Claude Code session on this Mac now waits for a pass from your phone, and no project setting can switch that off."
-    echo "Sessions already running pick it up within moments. To remove it: sudo sh \"$here/seal-lockdown\" remove"
+    echo "Sessions already running pick it up within moments. To remove it: sudo sh \"$root/seal-lockdown\" remove"
     ;;
   pair)
     if [ ! -e "$root/lockdown.json" ]; then
@@ -96,7 +124,7 @@ case "${1:-}" in
     fi
     # The key comes in as an argument, filled in by your own shell from your clipboard ("$(pbpaste)"):
     # running as root, this script can't read your clipboard itself.
-    line=$(printf '%s\n' "${2:-}" | /usr/bin/grep -E '^(ecdsa-sha2-nistp256|ssh-ed25519) ' | /usr/bin/head -1 || true)
+    line=$(strict_key "$(printf '%s\n' "${2:-}" | /usr/bin/grep -E '^(ecdsa-sha2-nistp256|ssh-ed25519) ' | /usr/bin/head -1)")
     if [ -z "$line" ]; then
       echo "seal-lockdown: no phone key on the clipboard. In Seal: Sign page, Copy SSH key. Then run this again." >&2
       exit 1

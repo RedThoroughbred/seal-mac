@@ -303,6 +303,16 @@ def pending_path(command, where):
     return folder("pending", key_of(command, where) + ".json")
 
 
+def short_lived(found):
+    """A kept request's times, when they are whole numbers, it was asked no later than now, and it is good
+    for five minutes at most. The kept files belong to the same user the agents run as: a request with a
+    far-off end would let one signature count for years (Fable review, finding 7)."""
+    asked, until = (found.get("asked"), found.get("until")) if isinstance(found, dict) else (None, None)
+    if type(asked) is not int or type(until) is not int:
+        return False
+    return asked <= time.time() + 60 and 0 < until - asked <= 300
+
+
 def read_pending(command, where):
     """The request waiting for this command, when there is one and it is still good."""
     path = pending_path(command, where)
@@ -311,7 +321,8 @@ def read_pending(command, where):
             waiting = json.load(handle)
     except (OSError, ValueError):
         return None
-    if not isinstance(waiting, dict) or waiting.get("command") != command or waiting.get("in") != where or time.time() >= until_of(waiting):
+    if (not isinstance(waiting, dict) or waiting.get("command") != command or waiting.get("in") != where
+            or time.time() >= until_of(waiting) or not short_lived(waiting)):
         try:
             os.unlink(path)
         except OSError:
@@ -781,7 +792,9 @@ def settings():
     """The settings that put a Claude Code session under the lock. Messages and tools both go through
     it, and `onFailure` makes a lock that cannot start, breaks or takes too long hold as well: without
     it, Claude Code lets the message or the tool go ahead."""
-    one = {"type": "command", "command": os.path.realpath(__file__), "args": ["hook"], "onFailure": "block"}
+    one = {"type": "command", "command": "/usr/bin/env",
+           "args": ["-i", "LANG=en_US.UTF-8", "/usr/bin/python3", "-I", os.path.realpath(__file__), "hook", "--hardened"],
+           "onFailure": "block"}
     print(json.dumps({"hooks": {
         "UserPromptSubmit": [{"hooks": [one]}],
         "PreToolUse": [{"matcher": "*", "hooks": [one]}],
@@ -911,9 +924,11 @@ def by_hand():
 
 OFF_WORDS = "Turn the Seal lock off"
 OFF_WHY = "someone typed /seal:off"
-# The plugin's commands a held message may still be, typed alone. None of them opens anything:
-# /seal:off only asks the phone, and the lock goes off on the phone's yes alone.
-LET_THROUGH = re.compile(r"/seal:(status|on|off|drop|lockdown|pass(\s+\d{1,3})?)")
+# The plugin's commands a held message may still be, typed alone. None of them opens anything, and none
+# writes the clipboard or replaces a waiting request: /seal:off and /seal:pass are held like any message
+# while no pass is good, so a sender who can't sign can't swap what the person is about to sign
+# (Fable review, finding 6).
+LET_THROUGH = re.compile(r"/seal:(status|on|drop|lockdown)")
 KEY_KINDS = ("ecdsa-sha2-nistp256 ", "ssh-ed25519 ")
 
 
@@ -961,6 +976,12 @@ def off_by_message(said):
 
 
 def lockdown_tool():
+    """The lockdown script to name to the person. Once lockdown is in, its own root-owned copy: running
+    the plugin's copy with sudo would let whoever can edit the plugin folder run code as root (Fable
+    review, finding 2)."""
+    installed = os.path.join(LOCKDOWN_ROOT, "seal-lockdown")
+    if lockdown_installed() and os.path.exists(installed):
+        return installed
     return os.path.join(os.path.dirname(os.path.realpath(__file__)), "seal-lockdown")
 
 
@@ -1097,6 +1118,9 @@ def lock_status():
         problem = lockdown_problem()
         if problem is not None:
             say(f"Problem: {problem}.")
+        if not managed_hook_present(MANAGED_SETTINGS, os.path.join(LOCKDOWN_ROOT, "seal-gate")):
+            say(f"Problem: the lockdown's hook is not in {MANAGED_SETTINGS}. The plugin still holds sessions; "
+                f'to put it back: sudo sh "{lockdown_tool()}" install')
     elif lock_is_on():
         say("Seal: the lock is ON. Claude Code sessions with the Seal plugin wait for a pass from your phone.")
         say("A project's settings could still switch this off. /seal:lockdown makes it hold against that.")
@@ -1142,14 +1166,14 @@ def lockdown_help():
     return 0
 
 
-def lockdown_entry(gate, root):
+def lockdown_entry(gate, root, python="/usr/bin/python3"):
     """The hook the lockdown puts in Claude Code's admin-owned settings. Run with `args`, so no shell
-    takes part, with an empty environment and Python in isolated mode: nothing from the session or
-    a project's settings reaches it."""
+    takes part, with an empty environment and Python in isolated mode, named by its real root-owned
+    path rather than Apple's /usr/bin stand-in: nothing from the session or a project reaches it."""
     return {
         "type": "command",
         "command": "/usr/bin/env",
-        "args": ["-i", "LANG=en_US.UTF-8", "/usr/bin/python3", "-I", gate, "hook", "--lockdown", "--root", root],
+        "args": ["-i", "LANG=en_US.UTF-8", python, "-I", gate, "hook", "--lockdown", "--root", root],
         "timeout": 30,
         "onFailure": "block",
     }
@@ -1159,7 +1183,32 @@ def is_ours(entry, gate):
     return isinstance(entry, dict) and entry.get("command") == "/usr/bin/env" and gate in (entry.get("args") or [])
 
 
-def managed(verb, path, gate, root):
+def managed_hook_present(path, gate):
+    found = kept(path)
+    hooks = (found or {}).get("hooks") if isinstance(found, dict) else None
+    if not isinstance(hooks, dict):
+        return False
+    return all(any(is_ours(each, gate) for group in (hooks.get(event) or []) if isinstance(group, dict)
+                   for each in (group.get("hooks") or []))
+               for event in ("UserPromptSubmit", "PreToolUse"))
+
+
+def root_owned_python():
+    """This Python's real path, when it and every folder above it belong to root and only root can
+    write them. None otherwise. Used by seal-lockdown, as root, to name the interpreter in the hook."""
+    path = os.path.realpath(sys.executable)
+    walk = path
+    while True:
+        info = os.lstat(walk)
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            return None
+        parent = os.path.dirname(walk)
+        if parent == walk:
+            return path
+        walk = parent
+
+
+def managed(verb, path, gate, root, python="/usr/bin/python3"):
     """Adds the lockdown's two hooks to Claude Code's managed settings file, or takes them out again,
     leaving everything else in the file as it was. Used by seal-lockdown, as root."""
     found = {}
@@ -1175,7 +1224,7 @@ def managed(verb, path, gate, root):
         groups = [group for group in (hooks.get(event) or [])
                   if not (isinstance(group, dict) and any(is_ours(each, gate) for each in group.get("hooks") or []))]
         if verb == "add":
-            group = {"hooks": [lockdown_entry(gate, root)]}
+            group = {"hooks": [lockdown_entry(gate, root, python)]}
             if event == "PreToolUse":
                 group = {"matcher": "*", **group}
             groups.append(group)
@@ -1237,9 +1286,16 @@ def main(arguments):
         return 0
     if arguments[0] == "slash":
         return slash(arguments[1:])
-    if arguments[0] == "managed" and len(arguments) == 5 and arguments[1] in ("add", "remove"):
+    if arguments[0] == "python-path" and len(arguments) == 1:
+        found = root_owned_python()
+        if found is None:
+            say("seal-gate: this Python, or a folder above it, can be changed by someone other than root.")
+            return 1
+        print(found)
+        return 0
+    if arguments[0] == "managed" and len(arguments) in (5, 6) and arguments[1] in ("add", "remove"):
         try:
-            managed(arguments[1], arguments[2], arguments[3], arguments[4])
+            managed(*arguments[1:])
         except (Refused, OSError, ValueError) as no:
             say(f"seal-gate: {no}")
             return 1

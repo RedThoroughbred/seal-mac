@@ -22,7 +22,14 @@ else
   lockroot="/Library/Application Support/Seal"
 fi
 if [ -e "$lockroot/lockdown.json" ]; then
-  exit 0
+  # Lockdown: the admin-owned hook holds, and this door holds too, with the root-owned lock, so a
+  # lockdown whose managed hook went missing still holds (Fable review, finding 3).
+  if [ "$1" = "--keep-env" ]; then
+    exec "${SEAL_TEST_PYTHON:-python3}" "$lockroot/seal-gate" hook --lockdown --root "$lockroot" --state "$dir" \
+      --copy "${SEAL_GATE_COPY:-/usr/bin/pbcopy}" --paste "${SEAL_GATE_PASTE:-/usr/bin/pbpaste}"
+  fi
+  python=$(/bin/cat "$lockroot/python-path" 2>/dev/null || echo /usr/bin/python3)
+  exec /usr/bin/env -i LANG=en_US.UTF-8 "$python" -I "$lockroot/seal-gate" hook --lockdown --root "$lockroot"
 fi
 if [ ! -e "$dir/lock-on" ] && [ ! -L "$dir/lock-on" ]; then
   exit 0

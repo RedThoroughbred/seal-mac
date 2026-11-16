@@ -42,9 +42,9 @@ From your next message, every Claude Code session on this Mac takes no message a
 | `/seal:git` | Sign this repository's commits with your phone |
 | `/seal:lockdown` | Make the lock hold against any project's settings (one step in Terminal, with your Mac's password) |
 
-While a session is locked, `/seal:status`, `/seal:on`, `/seal:off`, `/seal:drop` and `/seal:pass` still go through, typed alone. None of them opens anything. Claude can't run any of these commands itself.
+While a session is locked, `/seal:status`, `/seal:on`, `/seal:drop` and `/seal:lockdown` still go through, typed alone. None of them opens anything or touches the clipboard. `/seal:off` and `/seal:pass` wait for a pass like any message, so nobody who can't sign can swap the request you are about to sign. Claude can't run any of these commands itself, and they ignore whatever a session or a project sets in the environment.
 
-**Away from the Mac,** with Remote Control on your phone: the held message shows the request as one `seal://sign?…` line. Copy it into Seal, sign, and paste the signature back as your next message. That works for a pass and for `/seal:off`.
+**Away from the Mac,** with Remote Control on your phone: the held message shows the request as one `seal://sign?…` line. Copy it into Seal, sign, and paste the signature back as your next message. That works for a pass, and for `/seal:off` once a pass is good.
 
 ## Lock it down
 
@@ -61,7 +61,9 @@ It shows one `sudo` command to paste in the Terminal app. That command shows you
 
 From then on, every Claude Code session on this Mac waits for a pass, no project, local or user setting can switch it off (Claude Code's own rule for admin-owned hooks), and removing it or pairing another phone takes your Mac's password, which no agent has. The hook runs with an empty environment and Python in isolated mode, without a shell, so nothing a session or a project sets reaches it.
 
-Scheduled jobs that run Claude (a nightly check, an Agent SDK job) wait for a pass too. To remove it: `/seal:off` shows the `sudo` command.
+Before you type yes, the command shows the SHA-256 of the two files it installs; each release lists them, so you can check. From then on, removing it, pairing another phone and checking it (`/seal:off`, `/seal:pair`, `/seal:status`) use the root-owned copies, never the plugin's folder, which your user can change.
+
+Scheduled jobs that run Claude (a nightly check, an Agent SDK job) wait for a pass too.
 
 ## Lost your phone?
 
@@ -86,7 +88,7 @@ When git wants a signature, the request goes on the clipboard (with a notice on 
 - A pass, a yes to one command, a commit signature and a yes to turning the lock off are four different purposes. A signature made for one never counts as another, and a yes counts once.
 - If the lock breaks or can't start while it's on, it holds (`"onFailure": "block"`). While it's off, it doesn't start Python at all.
 - Without lockdown, the switch and the key live in your own files (`~/.seal-gate`): while a pass is good, an agent determined to remove the lock could, and a project's settings could switch the plugin off. With lockdown, neither can.
-- Even in lockdown, a pass opens the Mac for its length: an agent with tools could start a program of its own that keeps running after the pass ends. The lock holds Claude Code sessions, not every program on the Mac. Keep passes short.
+- **A pass opens every Claude Code session on the Mac for its length, not only yours.** If someone else is driving a session at the same time (a stolen login, a remote control you don't know about), it runs too, and with tools it could leave something behind that runs later: its own hook in your settings, a program of its own. The lock holds Claude Code sessions, not every program on the Mac. Keep passes short, and `/seal:drop` when you're done.
 - A command typed with `!` at the Mac's own keyboard runs without hooks. Whoever sits at your keyboard can open Terminal anyway; from the phone, a `!` line arrives as a plain message, and is held.
 - Without lockdown, a session started with your settings left out (`claude --setting-sources ""`) isn't under the lock. That is how a scheduled job stays out of it. The lock keeps your agents from being driven by someone else; it doesn't stop someone who can already run commands on your Mac.
 - It talks to no network. Signatures are checked by the Mac's own `ssh-keygen`.

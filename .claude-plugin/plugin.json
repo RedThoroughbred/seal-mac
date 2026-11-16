@@ -1,7 +1,7 @@
 {
   "name": "seal",
   "displayName": "Seal for Mac",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Lock your Claude Code sessions until your iPhone signs a pass with Face ID, and sign git commits with your phone. Needs the Seal app on the iPhone.",
   "author": {
     "name": "Seth Egger",
