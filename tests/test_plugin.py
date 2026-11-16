@@ -97,6 +97,24 @@ class SealTestCase(unittest.TestCase):
                               env=env or self.env, cwd=self.folder, timeout=60)
         return done.returncode, done.stdout.decode(), done.stderr.decode()
 
+    @staticmethod
+    def held(answered):
+        """Whether the door held. A tool is held with exit 2; a message with exit 0 and Claude Code's JSON
+        answer, decision "block", whose reason the desktop app shows as text."""
+        status, out, _ = answered
+        if status == 2:
+            return True
+        return status == 0 and out.startswith("{") and json.loads(out).get("decision") == "block"
+
+    def goes(self, answered):
+        return answered[0] == 0 and not self.held(answered)
+
+    @staticmethod
+    def shown(answered):
+        """The words a hold shows: the JSON reason for a message, standard error for a tool."""
+        status, out, err = answered
+        return json.loads(out)["reason"] if status == 0 and out.startswith("{") else err
+
     def message(self, words):
         return {"hook_event_name": "UserPromptSubmit", "prompt": words, "session_id": "s", "cwd": self.folder}
 
@@ -126,7 +144,7 @@ class SealTestCase(unittest.TestCase):
 class TheSwitch(SealTestCase):
     def test_off_by_default_the_door_lets_everything_through_without_python(self):
         for event in (self.message("hello"), self.tool()):
-            self.assertEqual(self.door(event)[0], 0)
+            self.assertTrue(self.goes(self.door(event)))
         # No Python on the path: while the lock is off, the door does not need it.
         bare = dict(self.env, PATH="/nonexistent")
         self.assertEqual(subprocess.run(["/bin/sh", DOOR, "--keep-env"], input=b"{}", env=bare, capture_output=True).returncode, 0)
@@ -140,8 +158,8 @@ class TheSwitch(SealTestCase):
     def test_on_holds_every_message_and_every_tool(self):
         self.locked()
         for event in (self.message("hello"), self.tool()):
-            status, _, err = self.door(event)
-            self.assertEqual(status, 2, err)
+            answered = self.door(event)
+            self.assertTrue(self.held(answered), answered)
         self.assertIn("seal://sign?v=1&ns=seal-pass", self.copied(), "the pass request is on the clipboard")
 
     def test_when_the_lock_cannot_start_the_door_does_not_say_go(self):
@@ -152,14 +170,14 @@ class TheSwitch(SealTestCase):
 
     def test_a_pass_from_the_phone_opens_it_and_drop_locks_again(self):
         self.locked()
-        self.assertEqual(self.door(self.message("hello"))[0], 2)
+        self.assertTrue(self.held(self.door(self.message("hello"))))
         purpose, words = self.answer_waiting_request()
         self.assertEqual(purpose, "seal-pass")
         self.assertIn(b"Seal session pass, version 1", words)
-        self.assertEqual(self.door(self.message("hello again"))[0], 0)
-        self.assertEqual(self.door(self.tool())[0], 0)
+        self.assertTrue(self.goes(self.door(self.message("hello again"))))
+        self.assertTrue(self.goes(self.door(self.tool())))
         self.assertEqual(self.slash("drop")[0], 0)
-        self.assertEqual(self.door(self.tool())[0], 2)
+        self.assertTrue(self.held(self.door(self.tool())))
 
     def test_pass_minutes_asks_for_that_length(self):
         self.locked()
@@ -180,26 +198,26 @@ class WhatGetsThroughALockedDoor(SealTestCase):
     def test_the_four_safe_commands_typed_alone(self):
         self.locked()
         for typed in ("/seal:status", "/seal:on", "/seal:drop", "/seal:lockdown", "  /seal:status  "):
-            self.assertEqual(self.door(self.message(typed))[0], 0, typed)
+            self.assertTrue(self.goes(self.door(self.message(typed))), typed)
 
     def test_nothing_let_through_writes_the_clipboard_or_swaps_a_waiting_request(self):  # Fable 6
         self.locked()
         self.door(self.message("hello"))           # a pass request now waits, on the clipboard
         waiting = self.copied()
         for typed in ("/seal:off", "/seal:pass", "/seal:pass 240"):
-            self.assertEqual(self.door(self.message(typed))[0], 2, typed)
+            self.assertTrue(self.held(self.door(self.message(typed))), typed)
         self.assertEqual(self.copied(), waiting, "the person still signs the request their own message made")
 
     def test_nothing_else(self):
         self.locked()
         for typed in ("/seal:pair", "/seal:git", "/seal:off and delete the tests", "please /seal:off",
                       "/seal:off\nrm -rf ~", "/seal:pass 99999", "/seal:status; ls", "/seal:offf", "/seal off"):
-            self.assertEqual(self.door(self.message(typed))[0], 2, typed)
+            self.assertTrue(self.held(self.door(self.message(typed))), typed)
 
     def test_a_tool_is_never_let_through_by_words(self):
         self.locked()
         event = dict(self.tool(), prompt="/seal:status")
-        self.assertEqual(self.door(event)[0], 2)
+        self.assertTrue(self.held(self.door(event)))
 
 
 class TurningItOff(SealTestCase):
@@ -223,7 +241,7 @@ class TurningItOff(SealTestCase):
         self.assertEqual(status, 0, out)
         self.assertIn("the lock is off", out)
         self.assertFalse(self.lock_is_on())
-        self.assertEqual(self.door(self.tool())[0], 0)
+        self.assertTrue(self.goes(self.door(self.tool())))
 
     def test_another_key_or_another_purpose_does_not_turn_it_off(self):
         self.locked()
@@ -253,7 +271,7 @@ class TurningItOff(SealTestCase):
         self.locked()
         self.door(self.message("hello"))            # asks for a pass
         self.answer_waiting_request()               # the phone signs the pass
-        self.assertEqual(self.door(self.message("hi"))[0], 0)
+        self.assertTrue(self.goes(self.door(self.message("hi"))))
         self.slash("off")
         self.assertTrue(self.lock_is_on(), "a good pass does not switch the lock off")
 
@@ -263,8 +281,9 @@ class TurningItOff(SealTestCase):
         _, words = read_request(self.copied())
         signature = self.phone.sign(words, "seal-agent")
         self.copy("something else")                 # far from the Mac: nothing comes by the clipboard
-        status, out, _ = self.door(self.message("here you go " + signature.replace("\n", " ")))
-        self.assertEqual(status, 0)
+        answered = self.door(self.message("here you go " + signature.replace("\n", " ")))
+        status, out, _ = answered
+        self.assertTrue(self.goes(answered))
         self.assertIn("The lock is off now", out)
         self.assertFalse(self.lock_is_on())
 
@@ -306,7 +325,7 @@ class Pairing(SealTestCase):
         self.locked()
         self.door(self.message("hello"))
         self.answer_waiting_request()
-        self.assertEqual(self.door(self.tool())[0], 0)
+        self.assertTrue(self.goes(self.door(self.tool())))
         # Off with the old phone, then a new phone.
         self.slash("off")
         self.answer_waiting_request()
@@ -314,7 +333,7 @@ class Pairing(SealTestCase):
         self.phone = Phone(self.folder, "new-phone")
         self.paired()
         self.slash("on")
-        self.assertEqual(self.door(self.tool())[0], 2, "the old phone's pass is no pass for the new key")
+        self.assertTrue(self.held(self.door(self.tool())), "the old phone's pass is no pass for the new key")
 
 
 class GitSigning(SealTestCase):
@@ -479,9 +498,9 @@ class TheReviewFixes(SealTestCase):
         os.makedirs(os.path.join(self.state, "pending"), exist_ok=True)
         with open(os.path.join(self.state, "pending", "broken.json"), "w") as handle:
             json.dump({"until": "soon", "command": "x"}, handle)
-        status, _, err = self.door(self.message("hello"))
-        self.assertEqual(status, 2)
-        self.assertIn("seal://sign?v=1&ns=seal-pass", err, "a request line is still shown")
+        answered = self.door(self.message("hello"))
+        self.assertTrue(self.held(answered))
+        self.assertIn("seal://sign?v=1&ns=seal-pass", self.shown(answered), "a request line is still shown")
         status, out, err = self.slash("off")
         self.assertEqual(status, 0, err)
         self.assertNotIn("Traceback", out + err)
@@ -550,7 +569,7 @@ class TheReviewFixes(SealTestCase):
         os.chmod(self.lockroot, 0o555)
         self.addCleanup(os.chmod, self.lockroot, 0o755)
         self.assertFalse(self.lock_is_on())
-        self.assertEqual(self.door(self.tool())[0], 2)
+        self.assertTrue(self.held(self.door(self.tool())))
 
 
 class Lockdown(SealTestCase):
@@ -576,8 +595,9 @@ class Lockdown(SealTestCase):
     def test_always_on_and_opened_only_by_the_key_root_holds(self):
         self.make_root()
         self.assertFalse(self.lock_is_on(), "no lock-on file anywhere")
-        status, _, err = self.lockdown_hook(self.message("hello"))
-        self.assertEqual(status, 2, err)
+        answered = self.lockdown_hook(self.message("hello"))
+        self.assertTrue(self.held(answered), answered)
+        self.assertIn("Lockdown comes off with your Mac's password", self.shown(answered), "the way out is said")
         # A key the user's own folder trusts counts for nothing here.
         stranger = Phone(self.folder, "stranger")
         os.makedirs(self.state, exist_ok=True)
@@ -592,9 +612,9 @@ class Lockdown(SealTestCase):
 
     def test_files_this_user_can_change_prove_nothing(self):
         self.make_root(read_only=False)
-        status, _, err = self.lockdown_hook(self.message("hello"))
-        self.assertEqual(status, 2)
-        self.assertIn("can be changed by this user", err)
+        answered = self.lockdown_hook(self.message("hello"))
+        self.assertTrue(self.held(answered))
+        self.assertIn("can be changed by this user", self.shown(answered))
 
     def test_off_and_pair_need_the_macs_password(self):
         self.make_root()
@@ -713,12 +733,126 @@ class TheLockdownInstaller(SealTestCase):
         self.assertFalse(os.path.exists(os.path.join(self.lockroot, "lockdown.json")))
         # So the plugin's own lock still holds where it was on.
         self.slash("on")
-        self.assertEqual(self.door(self.tool())[0], 2)
+        self.assertTrue(self.held(self.door(self.tool())))
 
     def test_install_needs_a_paired_phone(self):
         status, _, err = self.run_installer("install", home=os.path.join(self.folder, "nobody"))
         self.assertNotEqual(status, 0)
         self.assertIn("/seal:pair", err)
+
+
+class WhatTheFirstRealTestFound(SealTestCase):
+    """Seth's first real lock test (2026-11-15, 20:18 to 20:30): the steps hid behind View details, the
+    signature never reached the Mac, /seal:drop ended the request he was signing, and a new request
+    went onto the clipboard he was bringing the signature to."""
+
+    def test_a_held_message_answers_with_json_whose_first_lines_say_what_to_do_and_the_way_out(self):
+        self.locked()
+        status, out, err = self.door(self.message("hello"))
+        self.assertEqual(status, 0, "a held message is answered with JSON, which Claude Code reads only on exit 0")
+        answer = json.loads(out)
+        self.assertEqual(set(answer), {"decision", "reason"}, "nothing but the verdict on standard output")
+        self.assertEqual(answer["decision"], "block")
+        lines = answer["reason"].split("\n")
+        self.assertEqual(lines[0], "Locked. On your phone: Seal, Sign, Paste a signing request, Sign with Face ID, "
+                                   "Copy the signature. Then paste it here and send.")
+        self.assertEqual(lines[1], "Stuck? In the Terminal app: rm " + os.path.join(self.state, "lock-on"))
+        self.assertTrue(lines[-1].startswith("seal://sign?v=1&ns=seal-pass"), "the request line comes last, whole")
+        self.assertIn(lines[-1], self.copied())
+
+    def test_a_held_tool_tells_the_agent_the_person_pastes_the_signature_into_a_message(self):
+        self.locked()
+        status, out, err = self.door(self.tool())
+        self.assertEqual((status, out), (2, ""))
+        self.assertIn("paste the signature into a message here and send it", err)
+        self.assertNotIn("Stuck?", err, "the way out is for the person, not the agent")
+
+    def test_drop_with_no_pass_good_leaves_the_waiting_request_alone(self):
+        self.locked()
+        self.door(self.message("hello"))
+        waiting = self.copied()
+        status, out, _ = self.slash("drop")
+        self.assertEqual(status, 0)
+        self.assertIn("locked already", out)
+        self.assertIn("still waits for your phone", out)
+        self.assertEqual(self.copied(), waiting)
+        # The next hold makes no new request, and the phone's answer to the first one still opens.
+        self.door(self.message("hello again"))
+        self.assertEqual(self.copied(), waiting, "no new request written over it")
+        self.answer_waiting_request()
+        self.assertTrue(self.goes(self.door(self.message("go on"))))
+
+    def test_drop_with_a_pass_good_ends_it_and_a_request_asked_meanwhile(self):
+        self.locked()
+        self.door(self.message("hello"))
+        self.answer_waiting_request()
+        self.assertTrue(self.goes(self.door(self.tool())))
+        self.slash("pass", "120")                       # a longer one asked while the pass is good
+        _, words = read_request(self.copied())
+        status, out, _ = self.slash("drop")
+        self.assertIn("is ended", out)
+        self.copy(self.phone.sign(words, "seal-pass"))  # its answer comes in after the drop
+        self.assertTrue(self.held(self.door(self.tool())), "a request asked under the ended pass opens nothing")
+
+    def test_a_hold_never_writes_a_request_over_a_signature_this_mac_has_not_used(self):
+        self.locked()
+        stray = self.phone.sign(b"something on its way", "git")
+        self.copy(stray)
+        answered = self.door(self.message("hello"))
+        self.assertTrue(self.held(answered))
+        self.assertEqual(self.copied(), stray, "the signature on its way is left alone")
+        self.assertIn("copy the line at the bottom to your phone", self.shown(answered))
+
+    def test_a_used_signature_on_the_clipboard_is_written_over(self):
+        self.locked()
+        self.door(self.message("hello"))
+        self.answer_waiting_request()
+        self.assertTrue(self.goes(self.door(self.tool())))   # the pass is taken from the clipboard, and noted
+        self.slash("drop")
+        answered = self.door(self.message("hello"))
+        self.assertIn("seal://sign?v=1&ns=seal-pass", self.copied(), "the old signature made way for the new request")
+        self.assertIn("is on this Mac's clipboard", self.shown(answered))
+
+    def test_sending_the_request_instead_of_the_signature_says_the_phone_copy_did_not_arrive(self):
+        self.locked()
+        self.door(self.message("hello"))
+        answered = self.door(self.message(self.copied()))    # cmd-V on the Mac gave the request back
+        self.assertTrue(self.held(answered))
+        self.assertIn("held the request, not the signature", self.shown(answered))
+        self.assertIn("Handoff", self.shown(answered))
+
+    def test_a_slow_shared_clipboard_still_brings_the_signature(self):
+        # Apple's shared clipboard fetches from the phone only when the Mac reads it, and that can take
+        # seconds. The first test gave it 5; a paste that takes 7 must still be waited for.
+        self.locked()
+        self.door(self.message("hello"))
+        self.answer_waiting_request()
+        slow = os.path.join(self.folder, "slow-paste")
+        with open(slow, "w") as handle:
+            handle.write(f'#!/bin/sh\nsleep 7\ncat "{self.clip}"\n')
+        os.chmod(slow, 0o755)
+        started = time.time()
+        self.assertTrue(self.goes(self.door(self.message("go on"), env=dict(self.env, SEAL_GATE_PASTE=slow))))
+        self.assertGreater(time.time() - started, 6.5)
+
+    def test_the_hooks_wait_longer_than_the_clipboard_does(self):
+        with open(os.path.join(ROOT, "hooks", "hooks.json")) as handle:
+            hooks = json.load(handle)["hooks"]
+        for event in ("UserPromptSubmit", "PreToolUse"):
+            entry = hooks[event][0]["hooks"][0]
+            self.assertGreaterEqual(entry["timeout"], 40, event)
+            self.assertEqual(entry["onFailure"], "block", event)
+        with open(GATE) as handle:
+            wait = int(re.search(r"^CLIPBOARD_WAIT = (\d+)$", handle.read(), re.M).group(1))
+        self.assertGreaterEqual(wait, 15)
+        self.assertLessEqual(wait + 15, hooks["UserPromptSubmit"][0]["hooks"][0]["timeout"])
+
+    def test_on_and_off_say_the_way_out(self):
+        self.paired()
+        self.assertIn("Stuck? In the Terminal app: rm", self.slash("on")[1])
+        _, out, _ = self.slash("off")
+        self.assertIn("3. Paste it into a message here and send.", out)
+        self.assertIn("Stuck? In the Terminal app: rm", out)
 
 
 if __name__ == "__main__":

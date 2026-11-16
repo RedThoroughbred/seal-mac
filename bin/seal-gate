@@ -33,8 +33,8 @@ ID, over words that name this Mac and the time the pass ends.
 The switch. The Seal plugin's hooks call seal-hook, which lets everything through at once while the
 lock is off and calls `seal-gate hook` while it is on. On is a file, lock-on, in this tool's folder.
 Off takes a yes signed on the phone over the words "Turn the Seal lock off", so nothing on this Mac
-switches it off by itself. While the lock holds, five of the plugin's commands still go through:
-/seal:status, /seal:on, /seal:off, /seal:drop and /seal:pass, each typed alone.
+switches it off by itself. While the lock holds, four of the plugin's commands still go through,
+each typed alone: /seal:status, /seal:on, /seal:drop and /seal:lockdown.
 
 ask   makes a request for exactly that command in that folder, shows it as one "seal://sign?..." line
       and puts the line on the clipboard. On the phone: Seal, Sign, Paste a signing request, read it,
@@ -58,9 +58,11 @@ pass try    asks for a pass and waits three minutes for the phone's answer to ar
 hook        the lock itself, made for Claude Code's hooks UserPromptSubmit and PreToolUse (the event
             comes as JSON on standard input). With a good pass it says nothing and exits 0: it never
             says yes to a tool by itself, so the agent's own rules and questions apply as always. With
-            no pass it exits 2, which holds the message or the tool, and says how to unlock. A
-            signature pasted into a message is taken as the answer, for when the phone is far from the
-            Mac. Whatever goes wrong inside the lock holds too.
+            no pass it holds: a tool with exit 2 and words for the agent; a message with Claude Code's
+            JSON answer (decision "block"), whose reason the desktop app shows as text, saying how to
+            unlock and how to get out. The usual answer is the signature pasted into a message (on the
+            Mac, the paste fetches it from the phone); one found on the clipboard counts too. Whatever
+            goes wrong inside the lock holds too.
 settings    prints the settings that put a Claude Code session under the lock: both hooks, each told
             to hold when the lock cannot even start. For one session and nothing kept:
             claude --settings "$(seal-gate settings)"
@@ -80,8 +82,10 @@ It talks to no network. The clipboard is the Mac's own (pbcopy, pbpaste); Apple'
 carries it to the phone and back when both are signed in to the same account and near each other.
 """
 import base64
+import contextlib
 import fcntl
 import hashlib
+import io
 import json
 import os
 import re
@@ -118,6 +122,10 @@ PASS_USUAL = 30 * 60
 PASS_LONGEST = 4 * 60 * 60
 PASS_AT_MOST = shorter("SEAL_GATE_PASS_SECONDS", PASS_LONGEST)
 BEGIN, END = "-----BEGIN SSH SIGNATURE-----", "-----END SSH SIGNATURE-----"
+# How long a hold gives Apple's shared clipboard to bring a copy over from the phone. It fetches only
+# when something reads the clipboard, and 5 seconds was too short in Seth's first real test
+# (2026-11-15); the hooks wait 45 seconds in all.
+CLIPBOARD_WAIT = 20
 # No signature the phone makes comes near this many letters.
 LONGEST_SIGNATURE = 8192
 PARTS = ("", "pending", "used", "pass", os.path.join("pass", "ended"))
@@ -416,6 +424,24 @@ def from_clipboard(wait=20):
         return ""
 
 
+def mark_of(signature):
+    return hashlib.sha256("".join(signature.split()).encode()).hexdigest()[:32]
+
+
+def remember_taken(signature):
+    """Notes that this Mac has used that signature. A hold may write a new request over a used one on
+    the clipboard; one not noted here may be on its way from the phone, and is left alone."""
+    path = folder("taken.json")
+    marks = (kept(path) or {}).get("marks")
+    marks = [mark for mark in marks if isinstance(mark, str)][-15:] if isinstance(marks, list) else []
+    keep(path, {"marks": marks + [mark_of(signature)]})
+
+
+def was_taken(signature):
+    marks = (kept(folder("taken.json")) or {}).get("marks")
+    return isinstance(marks, list) and mark_of(signature) in marks
+
+
 def signed_by_the_phone(message, signature, namespace):
     """The real ssh-keygen is the judge: the phone's key, this purpose, exactly these bytes."""
     with tempfile.NamedTemporaryFile("w", suffix=".sig", delete=False) as handle:
@@ -463,6 +489,7 @@ def check(command, where, text=None, quiet=False):
         return no("that yes was used already. A yes counts once.")
     with os.fdopen(marker, "w") as handle:
         json.dump({"until": waiting["until"], "command": command, "in": where, "at": int(time.time())}, handle)
+    remember_taken(signature)
     try:
         os.unlink(pending_path(command, where))
     except OSError:
@@ -579,6 +606,7 @@ def pass_take(text):
         if not signed_by_the_phone(pass_text(asked, until, number), signature, PASS_NAMESPACE):
             return None, "that signature is not a pass from your phone for the request that waits"
         keep(folder("pass", "held.json"), {"asked": asked, "until": until, "number": number, "signature": signature})
+        remember_taken(signature)
         try:
             os.unlink(folder("pass", "asked.json"))
         except OSError:
@@ -624,9 +652,10 @@ def pass_ask(length, copy=True, quiet=False):
         if held is not None:
             say(f"    (a pass is good now, until {clock(held)}; the new one takes its place once signed)")
         say()
-        say("1. In the Seal app: Sign, Paste a signing request" + (" (it is on the clipboard)." if copy else "."))
+        say("1. On your phone: Seal, Sign, Paste a signing request" + (" (it is on this Mac's clipboard)." if copy else "."))
         say("2. Read it there, Sign with Face ID, Copy the signature.")
-        say("3. Back here: send your message again, or run seal-gate pass check.")
+        say("3. Paste it into a message here and send." if SAY_TO is sys.stdout else
+            "3. Paste it into a message to Claude and send, or run seal-gate pass check (it looks on the clipboard).")
         say(f"4. The request waits for its answer until {clock(answer_by)}.")
         say()
     print(line)
@@ -651,24 +680,28 @@ def pass_check(text=None, quiet=False):
 
 
 def pass_drop():
-    """Locks again now. The numbers of the pass and of a waiting request are kept as ended, so the same
-    signatures cannot be put back."""
+    """Locks again now. A good pass is ended, and so is a request asked while it was good (for a longer
+    one, say); their numbers are kept as ended, so the same signatures cannot be put back. With no pass
+    good it was locked already, and a request that waits for the phone stays: it is the person's way
+    back in. (Ending it in Seth's first real test, 2026-11-15, made the next hold write a new request
+    over the clipboard the signature was coming to.)"""
     with turn():
-        ended = None
-        for name in ("held.json", "asked.json"):
+        ended, _ = pass_held()
+        for name in ("held.json", "asked.json") if ended is not None else ("held.json",):
             fields = pass_fields(kept(folder("pass", name)))
             if fields is not None:
                 keep(folder("pass", "ended", fields[2] + ".json"), {"until": fields[1], "at": int(time.time())})
-                if name == "held.json" and time.time() < fields[1]:
-                    ended = fields[1]
             try:
                 os.unlink(folder("pass", name))
             except OSError:
                 pass
+        waiting = pass_waiting()
     if ended is not None:
         say(f"seal-gate: locked. The pass that was good until {clock(ended)} is ended.")
     else:
-        say("seal-gate: locked. No pass was good.")
+        say("seal-gate: locked already: no pass was good.")
+        if waiting is not None:
+            say(f"seal-gate: the request for a pass still waits for your phone, until {clock(min(waiting[1], waiting[0] + GOOD_FOR))}.")
     return 0
 
 
@@ -693,18 +726,42 @@ def pass_by_hand(length):
     return 1
 
 
-def held_message(line, until, answer_by, made, copied):
-    """What a person reads when the lock holds their message."""
-    where = "it was just put on this Mac's clipboard" if made and copied else "the line is below"
-    return "\n".join([
-        "Seal: agent sessions on this Mac are locked. Your message was not taken, and nothing runs.",
-        f"1. In the Seal app on your phone: Sign, Paste a signing request ({where}).",
-        "2. Read it there, Sign with Face ID, Copy the signature.",
-        "3. Send your message again. Away from the Mac? Paste the signature into the message.",
-        f"The pass would be good until {clock(until)}. The request waits for its answer until {clock(answer_by)}.",
-        "",
-        line,
-    ])
+HOW = "On your phone: Seal, Sign, Paste a signing request, Sign with Face ID, Copy the signature."
+
+
+def home_short(path):
+    home = own_home()
+    return "~" + path[len(home):] if path.startswith(home + os.sep) else path
+
+
+def way_out():
+    """The way out for a person at this Mac who can't get a pass: said where they read it, so nobody is
+    stuck inside Claude again (Seth's first real test, 2026-11-15). Anyone at the keyboard can open the
+    Terminal app anyway; lockdown keeps its door behind the Mac's password."""
+    if LOCKDOWN or lockdown_installed():
+        return f'Stuck? Lockdown comes off with your Mac\'s password: in the Terminal app, sudo sh "{lockdown_tool()}" remove'
+    return f"Stuck? In the Terminal app: rm {home_short(switch())}"
+
+
+def held_message(line, until, answer_by, made, copied, sent_the_request=False):
+    """What a person reads when the lock holds their message. The desktop app shows it as text under
+    "A hook blocked your prompt" while it is the latest thing in the chat, so the first two lines are
+    the whole story: what to do, and the way out."""
+    if made and copied:
+        where = "The request is on this Mac's clipboard for your phone, and it is the line at the bottom."
+    elif made:
+        where = ("The clipboard holds a signature this Mac has not used, so the request was left off it: "
+                 "copy the line at the bottom to your phone.")
+    else:
+        where = "The request went on this Mac's clipboard when it was made, and it is the line at the bottom."
+    lines = [f"Locked. {HOW} Then paste it here and send.", way_out()]
+    if sent_the_request:
+        lines.append("That message held the request, not the signature: the phone's copy did not reach this Mac. "
+                     "Handoff has to be on, on both (iPhone: Settings, General, AirPlay & Continuity; "
+                     "Mac: System Settings, General, AirDrop & Handoff). Or paste the signature from the phone "
+                     "through Remote Control.")
+    lines += [f"{where} It waits for your phone until {clock(answer_by)}; the pass would last until {clock(until)}.", "", line]
+    return "\n".join(lines)
 
 
 def held_tool(line):
@@ -712,7 +769,7 @@ def held_tool(line):
     return "\n".join([
         "Seal lock: agent sessions on this Mac are locked, so this tool did not run. Nothing runs until the person's phone signs a pass.",
         "This is the person's step, not yours. Tell them the session is locked and show them the request line below, whole.",
-        "They open it in the Seal app (Sign, Paste a signing request, Sign with Face ID, Copy the signature) and send the signature back as a message.",
+        f"{HOW} Then they paste the signature into a message here and send it.",
         "Do not try another tool, and do not look for a way around this. Stop and wait for them.",
         "",
         line,
@@ -720,52 +777,87 @@ def held_tool(line):
 
 
 def lock(event):
+    """The lock's verdict on one hook event: ("go", words for the agent or "") or ("hold", words)."""
     kind = event.get("hook_event_name")
     said = event.get("prompt") if kind == "UserPromptSubmit" else None
     said = said if isinstance(said, str) else None
 
     # The plugin's own commands that cannot open anything go through, typed alone: the person can see
-    # where the lock stands, end a pass, ask for a longer one, and ask the phone to switch the lock off.
+    # where the lock stands, end a pass, and read how lockdown works.
     if said is not None and LET_THROUGH.fullmatch(said.strip()):
-        return 0
+        return "go", ""
 
-    # The phone's answer may come inside the message itself: the way that works far from the Mac.
+    # The phone's answer inside the message: the usual way, since a paste on the Mac fetches the
+    # signature from the phone at that moment, and the only way far from the Mac.
     arrived = said is not None and BEGIN in said and pass_take(said)[0] is not None
     if said is not None and BEGIN in said and not arrived and off_by_message(said):
-        print("Seal: the signature in this message is the person's yes, signed on their phone, to turning the Seal lock off. "
-              "The lock is off now: sessions on this Mac run as usual. Say so in one line.")
-        return 0
+        return "go", ("Seal: the signature in this message is the person's yes, signed on their phone, to turning the Seal lock off. "
+                      "The lock is off now: sessions on this Mac run as usual. Say so in one line.")
     until, _ = pass_held()
-    if until is None and pass_waiting() is not None:
-        until, _ = pass_take(from_clipboard(5))
+    clip = None
+    if until is None:
+        # Read once: a signature the phone left on the shared clipboard is taken, and one that may still
+        # be on its way is never written over.
+        clip = from_clipboard(CLIPBOARD_WAIT)
+        if pass_waiting() is not None:
+            until, _ = pass_take(clip)
     if until is not None:
         if arrived:
             # The message goes on to the agent with a word about what the signature was. (Holding a message
             # that is nothing but the signature would read as "blocked" just when the lock opens.)
-            alone = "" if split_signature(said)[1].strip() else " The message holds nothing else: say so in one line and wait for what they want."
-            print(f"Seal: the signature in this message is a pass signed on the person's phone. Agent sessions on this Mac are unlocked until {clock(until)}.{alone}")
-        return 0
+            rest = (" Tell the person in one line that it is unlocked, then do what the rest of the message asks."
+                    if split_signature(said)[1].strip() else
+                    " The message holds nothing else: say so in one line and wait for what they want.")
+            return "go", f"Seal: the signature in this message is a pass signed on the person's phone. Agent sessions on this Mac are unlocked until {clock(until)}.{rest}"
+        return "go", ""
 
     try:
         line, until, answer_by, made = pass_request()
     except Refused as no:
-        say(f"Seal lock: agent sessions on this Mac are locked, and nothing can unlock them yet: {no}")
-        return 2
-    copied = made and to_clipboard(line)
-    say(held_message(line, until, answer_by, made, copied) if said is not None else held_tool(line))
+        return "hold", f"Locked, and nothing can unlock it yet: {no}\n{way_out()}"
+    fresh = signature_in(clip or "")
+    copied = made and (fresh is None or was_taken(fresh)) and to_clipboard(line)
+    if said is None:
+        return "hold", held_tool(line)
+    sent_the_request = "seal://sign?" in said and BEGIN not in said
+    return "hold", held_message(line, until, answer_by, made, copied, sent_the_request)
+
+
+def hold(kind, words):
+    """Holds what the hook was asked about. A message is held with Claude Code's JSON answer and exit 0:
+    the desktop app shows its reason as text, while with exit 2 it puts the hook's own command line in
+    front of the words. A tool, or anything that isn't a message, is held with exit 2, whose words go
+    to the agent. If the JSON can't be written, exit 2 holds the message too."""
+    if kind == "UserPromptSubmit":
+        try:
+            sys.stdout.write(json.dumps({"decision": "block", "reason": words}))
+            sys.stdout.flush()
+            return 0
+        except (OSError, ValueError):
+            pass
+    say(words)
     return 2
 
 
 def hook(options=()):
-    """What an agent's hooks call before a message is taken and before a tool runs. 0 lets it go on to
-    the agent's own rules, 2 holds it. Whatever goes wrong in here holds.
+    """What an agent's hooks call before a message is taken and before a tool runs. Lets it go on to the
+    agent's own rules (exit 0, saying nothing or a word for the agent), or holds it (see `hold`).
+    Whatever goes wrong in here holds.
 
     --hardened                      the plugin's hook: nothing taken from the surroundings
     --lockdown [--root DIR] [--state DIR] [--copy CMD --paste CMD]
                                     the admin-owned hook: always on; the paths come only from these
                                     arguments, which live in a root-owned file"""
+    kind = None
     try:
         options = list(options)
+        try:
+            event = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace"))
+        except ValueError:
+            event = {}
+        event = event if isinstance(event, dict) else {}
+        # Only a well-formed message is answered with JSON; anything else is held with exit 2.
+        kind = "UserPromptSubmit" if event.get("hook_event_name") == "UserPromptSubmit" and isinstance(event.get("prompt"), str) else None
         if "--lockdown" in options:
             def given(flag):
                 return options[options.index(flag) + 1] if flag in options[:-1] else None
@@ -773,18 +865,23 @@ def hook(options=()):
                    copy=given("--copy"), paste=given("--paste"))
             problem = lockdown_problem()
             if problem is not None:
-                say(f"Seal lock: agent sessions on this Mac are locked down, and {problem}. Nothing runs. "
-                    "In Terminal: sudo sh \"<the plugin>/bin/seal-lockdown\" status")
-                return 2
+                return hold(kind, f"Locked down, and {problem}. Nothing runs. "
+                                  f'In the Terminal app: sudo sh "{lockdown_tool()}" status')
         elif "--hardened" in options:
             harden()
-        try:
-            event = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace"))
-        except ValueError:
-            event = {}
-        return lock(event if isinstance(event, dict) else {})
+        # Nothing but the verdict reaches standard output: on a held message, Claude Code reads it as the
+        # JSON answer, and stray words there would read as context and let the message through.
+        with contextlib.redirect_stdout(io.StringIO()):
+            verdict, words = lock(event)
+        if verdict == "go":
+            if words:
+                sys.stdout.write(words)
+                sys.stdout.flush()
+            return 0
+        return hold(kind, words)
     except BaseException as wrong:
-        say(f"Seal lock: something went wrong inside the lock ({type(wrong).__name__}), so nothing runs. Try: seal-gate status")
+        say(f"Seal lock: something went wrong inside the lock ({type(wrong).__name__}), so nothing runs. "
+            "Stuck? In the Terminal app: rm ~/.seal-gate/lock-on")
         return 2
 
 
@@ -998,14 +1095,15 @@ def turn_on():
         say("Seal: the lock is already on.")
     else:
         keep(switch(), {"since": int(time.time())})
-        say("Seal: the lock is on. Every Claude Code session on this Mac that has the Seal plugin now waits for a pass "
-            "signed on your phone before it takes a message or runs a tool.")
+        say("Seal: the lock is on. Every Claude Code session on this Mac that has the Seal plugin, this one too, now waits "
+            "for a pass signed on your phone before it takes a message or runs a tool.")
     until, _ = pass_held()
     if until is not None:
         say(f"A pass is good until {clock(until)}, so sessions run until then. To lock now: /seal:drop")
     else:
         say(f"Your next message asks your phone for a pass ({span(PASS_USUAL)}; for longer, /seal:pass 120).")
     say("Turning it off needs your phone too: /seal:off")
+    say(way_out())
     return 0
 
 
@@ -1031,9 +1129,10 @@ def turn_off(text=None):
             say("Seal: the signature on the clipboard is not your phone's yes to turning the lock off. The lock stays on.")
             say()
     say("Seal: turning the lock off needs a yes from your phone.")
-    say("1. In the Seal app: Sign, Paste a signing request (it is on the clipboard).")
+    say("1. On your phone: Seal, Sign, Paste a signing request (it is on this Mac's clipboard).")
     say(f"2. It reads \"{OFF_WORDS}\". Sign with Face ID, Copy the signature.")
-    say("3. Back here: /seal:off again. Away from the Mac? Paste the signature into a message.")
+    say("3. Paste it into a message here and send.")
+    say(way_out())
     say()
     status_code = ask(OFF_WORDS, where, OFF_WHY, quiet=True)
     waiting = read_pending(OFF_WORDS, where)
@@ -1174,7 +1273,7 @@ def lockdown_entry(gate, root, python="/usr/bin/python3"):
         "type": "command",
         "command": "/usr/bin/env",
         "args": ["-i", "LANG=en_US.UTF-8", python, "-I", gate, "hook", "--lockdown", "--root", root],
-        "timeout": 30,
+        "timeout": 45,
         "onFailure": "block",
     }
 
