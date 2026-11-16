@@ -25,7 +25,7 @@
 
 I let AI agents work on my Mac all day, and anyone who gets into my Mac or my account can talk to them too. So I put my phone in the way. The key that opens the lock lives in the iPhone's security chip and only signs after Face ID, so nothing on the Mac can open it by itself: not a script, not an agent, not someone with a stolen login.
 
-This is the Mac side of [Seal](https://redthoroughbred.github.io/seal), an iPhone app that turns the phone into a security key.
+This plugin is one part of [Seal](https://redthoroughbred.github.io/seal), an iPhone app that turns your phone into a security key: it seals files that only your keys can open, signs your git commits, and keeps your keys in vaults. The plugin is the Mac side: this lock, and signing commits with your phone.
 
 ## Install
 
