@@ -1,17 +1,53 @@
-<p align="center"><img src=".claude-plugin/icon.png" width="96" alt="Seal"></p>
+# Seal for Mac: the details
 
-# Seal for Mac
+The [README](../README.md) is the tour. This page has the rest: every command, lockdown, a lost phone, git signing, and plainly what the lock holds and what it doesn't.
 
-**Lock your Claude Code sessions until your iPhone says yes with Face ID. Sign your git commits with your phone.**
+- [The loop](#the-loop)
+- [Install](#install)
+- [Pair your phone (once)](#pair-your-phone-once)
+- [Lock your sessions](#lock-your-sessions)
+- [Lock it down](#lock-it-down)
+- [Lost your phone?](#lost-your-phone)
+- [Sign git commits](#sign-git-commits)
+- [What it holds and what it doesn't](#what-it-holds-and-what-it-doesnt)
+- [Without the plugin](#without-the-plugin)
 
-This is the Mac side of [Seal](https://redthoroughbred.github.io/seal), an iPhone app that keeps a signing key in the phone's Secure Enclave. Nothing on your Mac can make that key's signatures, so nothing on your Mac can open the lock by itself: not a script, not an agent, not someone who got into your account.
+## The loop
+
+```mermaid
+sequenceDiagram
+    participant You
+    participant Claude as Claude Code on the Mac
+    participant Lock as The lock (seal-gate)
+    participant Phone as Seal on the iPhone
+    You->>Claude: a message
+    Claude->>Lock: hook: may this go on?
+    Lock-->>Claude: held: no pass is good
+    Lock->>Phone: the request, over the shared clipboard
+    Phone->>You: "Unlock Claude for 30 minutes on this Mac"
+    You->>Phone: Face ID
+    Phone-->>You: the signature, copied
+    You->>Claude: paste the signature and send
+    Claude->>Lock: hook: may this go on?
+    Lock->>Lock: ssh-keygen checks it against your phone's key
+    Lock-->>Claude: go on, until the pass ends
+```
+
+The Mac never sees the private key. It holds only the phone's public key, and a pass counts only if that key signed the exact words the Mac asked for: this Mac's name, how long, when it was asked, when it ends and a one-time number.
+
+## Install
 
 ```
-/plugin marketplace add RedThoroughbred/seal-mac
-/plugin install seal@seal-mac
+/plugin install seal --marketplace RedThoroughbred/seal-mac
 ```
 
-You need Seal on your iPhone, a Mac with Claude Code, and Python 3 (Claude Code users nearly always have it). The phone and the Mac hand the request and the answer over Apple's shared clipboard, so **Handoff has to be on, on both**: the same Apple Account, Wi-Fi and Bluetooth on, the phone near the Mac. iPhone: Settings, General, AirPlay & Continuity, Handoff. Mac: System Settings, General, AirDrop & Handoff. To check: copy a word on the phone, press ⌘V on the Mac, and the word should appear.
+or, in a terminal (in the Claude desktop app, `/plugin` opens the app's own settings):
+
+```
+claude plugin install seal --marketplace RedThoroughbred/seal-mac
+```
+
+You need Seal on your iPhone, a Mac with Claude Code 2.1.295 or later, and Apple's Python 3 at `/usr/bin/python3`. The phone and the Mac hand the request and the answer over Apple's shared clipboard, so **Handoff has to be on, on both**: the same Apple Account, Wi-Fi and Bluetooth on, the phone near the Mac. iPhone: Settings, General, AirPlay & Continuity, Handoff. Mac: System Settings, General, AirDrop & Handoff. To check: copy a word on the phone, press ⌘V on the Mac, and the word should appear.
 
 ## Pair your phone (once)
 
@@ -92,7 +128,10 @@ When git wants a signature, the request goes on the clipboard (with a notice on 
 - A pass, a yes to one command, a commit signature and a yes to turning the lock off are four different purposes. A signature made for one never counts as another, and a yes counts once.
 - If the lock breaks or can't start while it's on, it holds (`"onFailure": "block"`). While it's off, it doesn't start Python at all.
 - Without lockdown, the switch and the key live in your own files (`~/.seal-gate`): while a pass is good, an agent determined to remove the lock could, and a project's settings could switch the plugin off. With lockdown, neither can.
-- **A pass opens every Claude Code session on the Mac for its length, not only yours.** If someone else is driving a session at the same time (a stolen login, a remote control you don't know about), it runs too, and with tools it could leave something behind that runs later: its own hook in your settings, a program of its own. The lock holds Claude Code sessions, not every program on the Mac. Keep passes short, and `/seal:drop` when you're done.
+
+> [!IMPORTANT]
+> **A pass opens every Claude Code session on the Mac for its length, not only yours.** If someone else is driving a session at the same time (a stolen login, a remote control you don't know about), it runs too, and with tools it could leave something behind that runs later: its own hook in your settings, a program of its own. The lock holds Claude Code sessions, not every program on the Mac. Keep passes short, and `/seal:drop` when you're done.
+
 - A command typed with `!` at the Mac's own keyboard runs without hooks. Whoever sits at your keyboard can open Terminal anyway; from the phone, a `!` line arrives as a plain message, and is held.
 - Without lockdown, a session started with your settings left out (`claude --setting-sources ""`) isn't under the lock. That is how a scheduled job stays out of it. The lock keeps your agents from being driven by someone else; it doesn't stop someone who can already run commands on your Mac.
 - It talks to no network. Signatures are checked by the Mac's own `ssh-keygen`.
