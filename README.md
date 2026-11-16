@@ -40,7 +40,7 @@ If ⌘V gives you the request back instead, the phone's copy didn't reach the Ma
 | --- | --- |
 | `/seal:status` | Whether the lock is on, whether a pass is good and until when, which phone key is paired |
 | `/seal:pass 120` | Ask for a longer pass now (30 minutes unless you say, 4 hours at most) |
-| `/seal:drop` | End the pass now: everything locks again (with no pass good it changes nothing, and a request waiting for your phone keeps waiting) |
+| `/seal:drop` | Done for now? Ends your pass early, so everything is held again (with no pass good it changes nothing, and a request waiting for your phone keeps waiting) |
 | `/seal:off` | Turn the lock off. **This needs your phone too**: a yes signed for exactly "Turn the Seal lock off" |
 | `/seal:pair` | Pair a phone. Refused while the lock is on |
 | `/seal:git` | Sign this repository's commits with your phone |

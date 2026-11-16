@@ -1099,7 +1099,7 @@ def turn_on():
             "for a pass signed on your phone before it takes a message or runs a tool.")
     until, _ = pass_held()
     if until is not None:
-        say(f"A pass is good until {clock(until)}, so sessions run until then. To lock now: /seal:drop")
+        say(f"A pass is good until {clock(until)}, so sessions run until then. Done for now? /seal:drop ends your pass early.")
     else:
         say(f"Your next message asks your phone for a pass ({span(PASS_USUAL)}; for longer, /seal:pass 120).")
     say("Turning it off needs your phone too: /seal:off")
@@ -1233,7 +1233,7 @@ def lock_status():
         if allowed is not None and PASS_NAMESPACE not in allowed:
             say("That key may say yes to single commands only. /seal:pair again (with /seal:off first if the lock is on).")
     until, why = pass_held()
-    say(f"Pass: good until {clock(until)} ({left(until)} left). /seal:drop ends it." if until is not None else f"Pass: none ({why}).")
+    say(f"Pass: good until {clock(until)} ({left(until)} left). Done for now? /seal:drop ends it early." if until is not None else f"Pass: none ({why}).")
     asked = pass_waiting()
     if asked is not None:
         say(f"Waiting for your phone: a pass, until {clock(min(asked[1], asked[0] + GOOD_FOR))}.")
