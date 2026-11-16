@@ -1,0 +1,128 @@
+#!/bin/sh
+# seal-lockdown: puts the Seal lock in Claude Code's admin-owned settings, where no user, project or
+# local setting can switch it off. Run it yourself, in the Terminal app, with sudo:
+#
+#     sudo sh seal-lockdown install    the phone key that is paired now; asks you to confirm its fingerprint
+#     sudo sh seal-lockdown pair "$(pbpaste)"   a new phone key (copied on the phone); asks you to confirm it
+#     sudo sh seal-lockdown remove     takes the lockdown out again
+#     sudo sh seal-lockdown status
+#
+# What install does, and nothing else:
+#   - copies seal-gate and the phone's public key into /Library/Application Support/Seal, owned by root;
+#   - adds two hooks (before every message, before every tool) to
+#     /Library/Application Support/ClaudeCode/managed-settings.json, keeping whatever else is in it.
+# remove takes exactly those out. Your own ~/.seal-gate (passes, requests) stays where it is.
+#
+# Tests only: SEAL_LOCKDOWN_TEST=1 with SEAL_LOCKDOWN_ROOT, SEAL_MANAGED_FILE, SEAL_LOCKDOWN_HOME and
+# SEAL_LOCKDOWN_YES. sudo empties the environment, so none of these reach a real run.
+set -eu
+here=$(cd "$(/usr/bin/dirname "$0")" && pwd)
+PY="/usr/bin/env -i LANG=en_US.UTF-8 /usr/bin/python3 -I"
+if [ "${SEAL_LOCKDOWN_TEST:-}" = "1" ]; then
+  root="$SEAL_LOCKDOWN_ROOT"; managed="$SEAL_MANAGED_FILE"; home="$SEAL_LOCKDOWN_HOME"; owner=""
+  PY="${SEAL_TEST_PYTHON:-python3}"
+else
+  if [ "$(/usr/bin/id -u)" != "0" ]; then
+    echo "seal-lockdown: run it with sudo, in the Terminal app: sudo sh \"$0\" ${1:-install}" >&2
+    exit 1
+  fi
+  if [ -z "${SUDO_USER:-}" ] || [ "$SUDO_USER" = "root" ]; then
+    echo "seal-lockdown: run it with sudo from your own account, not as root." >&2
+    exit 1
+  fi
+  root="/Library/Application Support/Seal"
+  managed="/Library/Application Support/ClaudeCode/managed-settings.json"
+  eval "home=~$SUDO_USER"
+  owner="root:wheel"
+fi
+
+confirm() {
+  # $1: a public key line. Shows its fingerprint and asks for "yes".
+  tmp=$(/usr/bin/mktemp)
+  printf '%s\n' "$1" > "$tmp"
+  print=$(/usr/bin/ssh-keygen -l -f "$tmp" 2>/dev/null || true)
+  /bin/rm -f "$tmp"
+  if [ -z "$print" ]; then
+    echo "seal-lockdown: that is not a public key line." >&2
+    exit 1
+  fi
+  echo "The phone key: $print"
+  echo "Check it against your phone (Seal, Sign page) before you go on."
+  if [ "${SEAL_LOCKDOWN_YES:-}" = "1" ] && [ "${SEAL_LOCKDOWN_TEST:-}" = "1" ]; then
+    return 0
+  fi
+  printf 'Type yes to go on: '
+  read -r answer < /dev/tty
+  if [ "$answer" != "yes" ]; then
+    echo "seal-lockdown: nothing was changed."
+    exit 1
+  fi
+}
+
+put_key() {
+  # $1: the key line. The lock trusts this file, and only root can change it.
+  printf 'seal-gate namespaces="seal-agent,seal-pass" %s\n' "$1" > "$root/allowed_signers.part"
+  /bin/chmod 444 "$root/allowed_signers.part"
+  if [ -n "$owner" ]; then /usr/sbin/chown "$owner" "$root/allowed_signers.part"; fi
+  /bin/mv -f "$root/allowed_signers.part" "$root/allowed_signers"
+}
+
+case "${1:-}" in
+  install)
+    line=$(/usr/bin/awk '{ for (i = 3; i <= NF; i++) printf "%s%s", $i, (i < NF ? " " : "\n") }' "$home/.seal-gate/allowed_signers" 2>/dev/null || true)
+    if [ -z "$line" ] || ! /usr/bin/grep -q 'seal-pass' "$home/.seal-gate/allowed_signers" 2>/dev/null; then
+      echo "seal-lockdown: no phone key that may sign passes is paired. In Claude Code: /seal:pair first." >&2
+      exit 1
+    fi
+    confirm "$line"
+    /bin/mkdir -p "$root"
+    /bin/cp "$here/seal-gate" "$root/seal-gate.part"
+    /bin/chmod 555 "$root/seal-gate.part"
+    if [ -n "$owner" ]; then /usr/sbin/chown "$owner" "$root/seal-gate.part"; fi
+    /bin/mv -f "$root/seal-gate.part" "$root/seal-gate"
+    put_key "$line"
+    printf '{"installed": %s}\n' "$(/bin/date +%s)" > "$root/lockdown.json"
+    /bin/chmod 444 "$root/lockdown.json"
+    if [ -n "$owner" ]; then /usr/sbin/chown "$owner" "$root/lockdown.json"; /usr/sbin/chown "$owner" "$root"; fi
+    /bin/chmod 755 "$root"
+    $PY "$root/seal-gate" managed add "$managed" "$root/seal-gate" "$root"
+    echo "Lockdown is on. Every Claude Code session on this Mac now waits for a pass from your phone, and no project setting can switch that off."
+    echo "Sessions already running pick it up within moments. To remove it: sudo sh \"$here/seal-lockdown\" remove"
+    ;;
+  pair)
+    if [ ! -e "$root/lockdown.json" ]; then
+      echo "seal-lockdown: lockdown is not on. Pair with /seal:pair in Claude Code." >&2
+      exit 1
+    fi
+    # The key comes in as an argument, filled in by your own shell from your clipboard ("$(pbpaste)"):
+    # running as root, this script can't read your clipboard itself.
+    line=$(printf '%s\n' "${2:-}" | /usr/bin/grep -E '^(ecdsa-sha2-nistp256|ssh-ed25519) ' | /usr/bin/head -1 || true)
+    if [ -z "$line" ]; then
+      echo "seal-lockdown: no phone key on the clipboard. In Seal: Sign page, Copy SSH key. Then run this again." >&2
+      exit 1
+    fi
+    confirm "$line"
+    put_key "$line"
+    echo "The lockdown now trusts that key, and only it."
+    ;;
+  remove)
+    if [ -e "$root/seal-gate" ]; then
+      $PY "$root/seal-gate" managed remove "$managed" "$root/seal-gate" "$root"
+    fi
+    /bin/rm -rf "$root"
+    echo "Lockdown is off. The plain lock (/seal:on, /seal:off) works as before."
+    ;;
+  status)
+    if [ -e "$root/lockdown.json" ]; then
+      echo "Lockdown is on. Files: $root"
+      /bin/ls -le "$root"
+      /usr/bin/grep -c 'seal-gate' "$managed" >/dev/null 2>&1 && echo "Its hooks are in $managed." || echo "Its hooks are NOT in $managed: run install again."
+    else
+      echo "Lockdown is off."
+    fi
+    ;;
+  *)
+    echo "seal-lockdown: install, pair, remove or status (with sudo, in the Terminal app)." >&2
+    exit 2
+    ;;
+esac

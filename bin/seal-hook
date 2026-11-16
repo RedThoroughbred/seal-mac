@@ -1,10 +1,33 @@
 #!/bin/sh
 # The Seal lock's door, called by Claude Code before every message and every tool (hooks/hooks.json).
+#
+# It takes nothing from its surroundings: a project's settings can set environment variables for a
+# session, and once could point the lock at an empty folder (security review H1). So the home folder
+# comes from the system's user list, Python is Apple's own in isolated mode with an empty environment,
+# and the tools are the system's. Only the tests pass --keep-env, to use a folder and clipboard of
+# their own.
+#
 # While the lock is off there is no lock-on file, and this lets everything go at once without starting
-# Python. While it is on, the lock itself decides (seal-gate hook): 0 goes on, 2 holds. If the lock
-# cannot even start, this exits with another number, and the hook's "onFailure": "block" holds too.
-dir="${SEAL_GATE_DIR:-$HOME/.seal-gate}"
+# Python. While lockdown is on, the admin-owned hook holds instead, so this one stands aside. While the
+# lock is on, the lock itself decides (seal-gate hook): 0 goes on, 2 holds; if it can't even start, this
+# exits with another number and the hook's "onFailure": "block" holds too.
+here=$(/usr/bin/dirname "$0")
+if [ "$1" = "--keep-env" ]; then
+  dir="${SEAL_GATE_DIR:-$HOME/.seal-gate}"
+  lockroot="${SEAL_LOCKDOWN_ROOT:-/Library/Application Support/Seal}"
+else
+  user=$(/usr/bin/id -un)
+  eval "home=~$user"
+  dir="$home/.seal-gate"
+  lockroot="/Library/Application Support/Seal"
+fi
+if [ -e "$lockroot/lockdown.json" ]; then
+  exit 0
+fi
 if [ ! -e "$dir/lock-on" ] && [ ! -L "$dir/lock-on" ]; then
   exit 0
 fi
-exec python3 "$(dirname "$0")/seal-gate" hook
+if [ "$1" = "--keep-env" ]; then
+  exec "${SEAL_TEST_PYTHON:-python3}" "$here/seal-gate" hook
+fi
+exec /usr/bin/env -i LANG=en_US.UTF-8 /usr/bin/python3 -I "$here/seal-gate" hook --hardened

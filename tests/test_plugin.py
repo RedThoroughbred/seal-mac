@@ -21,6 +21,9 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 GATE = os.path.join(ROOT, "bin", "seal-gate")
+LOCKDOWN_TOOL = os.path.join(ROOT, "bin", "seal-lockdown")
+# The hooks run Apple's /usr/bin/python3 (3.9 today); the tests run under SEAL_TEST_PYTHON too.
+PY = os.environ.get("SEAL_TEST_PYTHON", "python3")
 DOOR = os.path.join(ROOT, "bin", "seal-hook")
 SSH_KEYGEN = "/usr/bin/ssh-keygen"
 
@@ -60,7 +63,10 @@ class SealTestCase(unittest.TestCase):
             handle.write(f'#!/bin/sh\ncat "{self.clip}" 2>/dev/null\n')
         os.chmod(copy, 0o755)
         os.chmod(paste, 0o755)
+        self.lockroot = os.path.join(self.folder, "lockdown")
+        self.copy_tool, self.paste_tool = copy, paste
         self.env = dict(os.environ, SEAL_GATE_DIR=self.state, SEAL_GATE_COPY=copy, SEAL_GATE_PASTE=paste,
+                        SEAL_LOCKDOWN_ROOT=self.lockroot, SEAL_TEST_PYTHON=PY,
                         SEAL_SIGN_DIR=os.path.join(self.folder, "sign"), SEAL_SIGN_NOTIFY="0", SEAL_SIGN_WAIT="20")
         self.phone = Phone(self.folder, "phone")
 
@@ -78,7 +84,7 @@ class SealTestCase(unittest.TestCase):
             return ""
 
     def run_tool(self, arguments, given=None, env=None, cwd=None):
-        done = subprocess.run(["python3", GATE] + arguments, input=(given or "").encode(), capture_output=True,
+        done = subprocess.run([PY, GATE] + arguments, input=(given or "").encode(), capture_output=True,
                               env=env or self.env, cwd=cwd or self.folder, timeout=60)
         return done.returncode, done.stdout.decode(), done.stderr.decode()
 
@@ -87,7 +93,7 @@ class SealTestCase(unittest.TestCase):
 
     def door(self, event, env=None):
         """The plugin's hook, called the way Claude Code calls it: through sh and seal-hook."""
-        done = subprocess.run(["sh", DOOR], input=json.dumps(event).encode(), capture_output=True,
+        done = subprocess.run(["sh", DOOR, "--keep-env"], input=json.dumps(event).encode(), capture_output=True,
                               env=env or self.env, cwd=self.folder, timeout=60)
         return done.returncode, done.stdout.decode(), done.stderr.decode()
 
@@ -123,7 +129,7 @@ class TheSwitch(SealTestCase):
             self.assertEqual(self.door(event)[0], 0)
         # No Python on the path: while the lock is off, the door does not need it.
         bare = dict(self.env, PATH="/nonexistent")
-        self.assertEqual(subprocess.run(["/bin/sh", DOOR], input=b"{}", env=bare, capture_output=True).returncode, 0)
+        self.assertEqual(subprocess.run(["/bin/sh", DOOR, "--keep-env"], input=b"{}", env=bare, capture_output=True).returncode, 0)
 
     def test_on_needs_a_paired_phone(self):
         status, out, _ = self.slash("on")
@@ -140,8 +146,8 @@ class TheSwitch(SealTestCase):
 
     def test_when_the_lock_cannot_start_the_door_does_not_say_go(self):
         self.locked()
-        bare = dict(self.env, PATH="/nonexistent")
-        status = subprocess.run(["/bin/sh", DOOR], input=json.dumps(self.tool()).encode(), env=bare, capture_output=True).returncode
+        bare = dict(self.env, PATH="/nonexistent", SEAL_TEST_PYTHON="/nonexistent/python3")
+        status = subprocess.run(["/bin/sh", DOOR, "--keep-env"], input=json.dumps(self.tool()).encode(), env=bare, capture_output=True).returncode
         self.assertNotIn(status, (0,), "without Python the hook fails, and onFailure: block holds")
 
     def test_a_pass_from_the_phone_opens_it_and_drop_locks_again(self):
@@ -445,13 +451,200 @@ class ThePluginFiles(unittest.TestCase):
     def test_every_command_is_the_persons_alone(self):
         folder = os.path.join(ROOT, "commands")
         names = sorted(name[:-3] for name in os.listdir(folder) if name.endswith(".md"))
-        self.assertEqual(names, ["drop", "git", "off", "on", "pair", "pass", "status"])
+        self.assertEqual(names, ["drop", "git", "lockdown", "off", "on", "pair", "pass", "status"])
         for name in names:
             with open(os.path.join(folder, name + ".md")) as handle:
                 text = handle.read()
             self.assertIn("disable-model-invocation: true", text, name)
             self.assertIn('allowed-tools: Bash(python3 "${CLAUDE_PLUGIN_ROOT}/bin/seal-gate":*)', text, name)
             self.assertIn(f'bin/seal-gate" slash {name}', text, name)
+
+
+class TheReviewFixes(SealTestCase):
+    """The Mac-side findings of the 2026-11-15 security review."""
+
+    def test_a_damaged_file_never_stops_the_lock_from_asking(self):  # L2
+        self.locked()
+        os.makedirs(os.path.join(self.state, "pending"), exist_ok=True)
+        with open(os.path.join(self.state, "pending", "broken.json"), "w") as handle:
+            json.dump({"until": "soon", "command": "x"}, handle)
+        status, _, err = self.door(self.message("hello"))
+        self.assertEqual(status, 2)
+        self.assertIn("seal://sign?v=1&ns=seal-pass", err, "a request line is still shown")
+        status, out, err = self.slash("off")
+        self.assertEqual(status, 0, err)
+        self.assertNotIn("Traceback", out + err)
+        self.assertEqual(self.slash("status")[0], 0)
+
+    def test_a_yes_for_one_word_break_is_no_yes_for_another(self):  # L1
+        self.paired()
+        status, out, err = self.run_tool(["ask", "--no-copy", "--", "echo", "a b"])
+        self.assertEqual(status, 0, err)
+        _, words = read_request(out)
+        self.assertIn(b"echo 'a b'", words)
+        self.copy(self.phone.sign(words, "seal-agent"))
+        self.assertNotEqual(self.run_tool(["check", "--", "echo", "a", "b"])[0], 0)
+        self.assertEqual(self.run_tool(["check", "--", "echo", "a b"])[0], 0)
+
+    def test_setup_takes_no_new_key_while_the_lock_is_on(self):  # M2
+        self.locked()
+        thief = Phone(self.folder, "thief")
+        status, _, err = self.run_tool(["--setup", thief.line])
+        self.assertEqual(status, 1)
+        self.assertIn("the lock is on", err)
+        with open(os.path.join(self.state, "allowed_signers")) as handle:
+            self.assertNotIn(thief.line.split()[1], handle.read())
+
+    def test_the_real_door_takes_no_folder_from_the_surroundings(self):  # H1, the plugin's door
+        if os.path.exists(os.path.expanduser("~/.seal-gate/lock-on")) or os.path.exists("/Library/Application Support/Seal/lockdown.json"):
+            self.skipTest("the lock is on for real on this Mac")
+        # The test's own folder says the lock is on; the real door ignores it and looks at the real home.
+        self.locked()
+        done = subprocess.run(["sh", DOOR], input=json.dumps(self.tool()).encode(), capture_output=True, env=self.env, timeout=60)
+        self.assertEqual(done.returncode, 0, "SEAL_GATE_DIR from a project's settings must not steer the real door")
+
+    def test_the_plugin_door_stands_aside_for_lockdown(self):
+        self.locked()
+        os.makedirs(self.lockroot)
+        open(os.path.join(self.lockroot, "lockdown.json"), "w").close()
+        self.assertEqual(self.door(self.tool())[0], 0)
+
+
+class Lockdown(SealTestCase):
+    """The admin-owned lock. Root owns its folder for real; here the folder is made read-only instead."""
+
+    def make_root(self, key_line=None, read_only=True):
+        os.makedirs(self.lockroot)
+        with open(os.path.join(self.lockroot, "allowed_signers"), "w") as handle:
+            handle.write(f'seal-gate namespaces="seal-agent,seal-pass" {key_line or self.phone.line}\n')
+        open(os.path.join(self.lockroot, "lockdown.json"), "w").close()
+        if read_only:
+            os.chmod(os.path.join(self.lockroot, "allowed_signers"), 0o444)
+            os.chmod(self.lockroot, 0o555)
+            self.addCleanup(os.chmod, self.lockroot, 0o755)
+
+    def lockdown_hook(self, event):
+        args = [PY, GATE, "hook", "--lockdown", "--root", self.lockroot, "--state", self.state,
+                "--copy", self.copy_tool, "--paste", self.paste_tool]
+        clean = {"PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8"}  # as the real hook gets it: almost nothing
+        done = subprocess.run(args, input=json.dumps(event).encode(), capture_output=True, env=clean, timeout=60)
+        return done.returncode, done.stdout.decode(), done.stderr.decode()
+
+    def test_always_on_and_opened_only_by_the_key_root_holds(self):
+        self.make_root()
+        self.assertFalse(self.lock_is_on(), "no lock-on file anywhere")
+        status, _, err = self.lockdown_hook(self.message("hello"))
+        self.assertEqual(status, 2, err)
+        # A key the user's own folder trusts counts for nothing here.
+        stranger = Phone(self.folder, "stranger")
+        os.makedirs(self.state, exist_ok=True)
+        with open(os.path.join(self.state, "allowed_signers"), "w") as handle:
+            handle.write(f'seal-gate namespaces="seal-agent,seal-pass" {stranger.line}\n')
+        _, words = read_request(self.copied())
+        self.copy(stranger.sign(words, "seal-pass"))
+        self.assertEqual(self.lockdown_hook(self.tool())[0], 2)
+        # The paired phone's pass opens it.
+        self.copy(self.phone.sign(words, "seal-pass"))
+        self.assertEqual(self.lockdown_hook(self.tool())[0], 0)
+
+    def test_files_this_user_can_change_prove_nothing(self):
+        self.make_root(read_only=False)
+        status, _, err = self.lockdown_hook(self.message("hello"))
+        self.assertEqual(status, 2)
+        self.assertIn("can be changed by this user", err)
+
+    def test_off_and_pair_need_the_macs_password(self):
+        self.make_root()
+        self.paired_for_slash = None
+        _, out, _ = self.slash("off")
+        self.assertIn("sudo sh", out)
+        self.assertIn("remove", out)
+        status, out, _ = self.slash("pair")
+        self.assertEqual(status, 1)
+        self.assertIn('pair "$(pbpaste)"', out)
+        self.assertIn("LOCKDOWN is on", self.slash("status")[1])
+
+
+class TheManagedSettingsFile(SealTestCase):
+    def managed(self, verb, path):
+        return self.run_tool(["managed", verb, path, "/L/Seal/seal-gate", "/L/Seal"])
+
+    def test_add_keeps_everything_else_and_remove_takes_only_ours(self):
+        path = os.path.join(self.folder, "managed-settings.json")
+        theirs = {"permissions": {"deny": ["Read(./.env)"]},
+                  "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "/opt/audit"}]}]}}
+        with open(path, "w") as handle:
+            json.dump(theirs, handle)
+        for _ in range(2):  # twice: still one of each
+            self.assertEqual(self.managed("add", path)[0], 0)
+        with open(path) as handle:
+            added = json.load(handle)
+        self.assertEqual(added["permissions"], theirs["permissions"])
+        self.assertEqual(len(added["hooks"]["PreToolUse"]), 2)
+        self.assertEqual(len(added["hooks"]["UserPromptSubmit"]), 1)
+        ours = added["hooks"]["UserPromptSubmit"][0]["hooks"][0]
+        self.assertEqual(ours["command"], "/usr/bin/env")
+        self.assertEqual(ours["args"][:5], ["-i", "LANG=en_US.UTF-8", "/usr/bin/python3", "-I", "/L/Seal/seal-gate"])
+        self.assertEqual(ours["onFailure"], "block")
+        self.assertEqual(self.managed("remove", path)[0], 0)
+        with open(path) as handle:
+            self.assertEqual(json.load(handle), theirs)
+
+    def test_a_file_that_was_only_ours_goes_away(self):
+        path = os.path.join(self.folder, "ClaudeCode", "managed-settings.json")
+        self.assertEqual(self.managed("add", path)[0], 0)
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(self.managed("remove", path)[0], 0)
+        self.assertFalse(os.path.exists(path))
+
+    def test_a_file_it_cant_read_is_left_alone(self):
+        path = os.path.join(self.folder, "managed-settings.json")
+        with open(path, "w") as handle:
+            handle.write("[1, 2]")
+        self.assertNotEqual(self.managed("add", path)[0], 0)
+        with open(path) as handle:
+            self.assertEqual(handle.read(), "[1, 2]")
+
+
+class TheLockdownInstaller(SealTestCase):
+    def run_installer(self, *words, home=None):
+        env = dict(self.env, SEAL_LOCKDOWN_TEST="1", SEAL_LOCKDOWN_YES="1", SEAL_LOCKDOWN_ROOT=self.lockroot,
+                   SEAL_MANAGED_FILE=os.path.join(self.folder, "managed-settings.json"),
+                   SEAL_LOCKDOWN_HOME=home or self.folder)
+        done = subprocess.run(["sh", LOCKDOWN_TOOL, *words], capture_output=True, env=env, timeout=60)
+        return done.returncode, done.stdout.decode(), done.stderr.decode()
+
+    def test_install_pair_and_remove(self):
+        # The paired key lives in <home>/.seal-gate/allowed_signers.
+        self.state = os.path.join(self.folder, ".seal-gate")
+        self.env["SEAL_GATE_DIR"] = self.state
+        self.paired()
+        status, out, err = self.run_installer("install")
+        self.assertEqual(status, 0, out + err)
+        self.assertIn("SHA256:", out, "the fingerprint is shown before anything changes")
+        with open(os.path.join(self.lockroot, "allowed_signers")) as handle:
+            self.assertIn(self.phone.line.split()[1], handle.read())
+        self.assertEqual(os.stat(os.path.join(self.lockroot, "allowed_signers")).st_mode & 0o777, 0o444)
+        with open(os.path.join(self.folder, "managed-settings.json")) as handle:
+            hooks = json.load(handle)["hooks"]
+        self.assertIn(os.path.join(self.lockroot, "seal-gate"), hooks["PreToolUse"][0]["hooks"][0]["args"])
+
+        new_phone = Phone(self.folder, "new")
+        self.assertNotEqual(self.run_installer("pair", "not a key")[0], 0)
+        status, out, err = self.run_installer("pair", "Seal key\n" + new_phone.line)
+        self.assertEqual(status, 0, out + err)
+        with open(os.path.join(self.lockroot, "allowed_signers")) as handle:
+            self.assertIn(new_phone.line.split()[1], handle.read())
+
+        status, out, err = self.run_installer("remove")
+        self.assertEqual(status, 0, out + err)
+        self.assertFalse(os.path.exists(self.lockroot))
+        self.assertFalse(os.path.exists(os.path.join(self.folder, "managed-settings.json")))
+
+    def test_install_needs_a_paired_phone(self):
+        status, _, err = self.run_installer("install", home=os.path.join(self.folder, "nobody"))
+        self.assertNotEqual(status, 0)
+        self.assertIn("/seal:pair first", err)
 
 
 if __name__ == "__main__":

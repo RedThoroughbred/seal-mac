@@ -40,10 +40,28 @@ From your next message, every Claude Code session on this Mac takes no message a
 | `/seal:off` | Turn the lock off. **This needs your phone too**: a yes signed for exactly "Turn the Seal lock off" |
 | `/seal:pair` | Pair a phone. Refused while the lock is on |
 | `/seal:git` | Sign this repository's commits with your phone |
+| `/seal:lockdown` | Make the lock hold against any project's settings (one step in Terminal, with your Mac's password) |
 
 While a session is locked, `/seal:status`, `/seal:on`, `/seal:off`, `/seal:drop` and `/seal:pass` still go through, typed alone. None of them opens anything. Claude can't run any of these commands itself.
 
 **Away from the Mac,** with Remote Control on your phone: the held message shows the request as one `seal://sign?…` line. Copy it into Seal, sign, and paste the signature back as your next message. That works for a pass and for `/seal:off`.
+
+## Lock it down
+
+`/seal:on` is a switch in your own files, so a project's Claude Code settings (or an agent that has a pass) can switch it off. **Lockdown** puts the lock in Claude Code's admin-owned settings instead:
+
+```
+/seal:lockdown
+```
+
+It shows one `sudo` command to paste in the Terminal app. That command shows your phone key's fingerprint, asks you to type yes, and then:
+
+- copies the lock and your phone's public key into `/Library/Application Support/Seal`, owned by root;
+- adds two hooks to `/Library/Application Support/ClaudeCode/managed-settings.json`, keeping anything else in that file.
+
+From then on, every Claude Code session on this Mac waits for a pass, no project, local or user setting can switch it off (Claude Code's own rule for admin-owned hooks), and removing it or pairing another phone takes your Mac's password, which no agent has. The hook runs with an empty environment and Python in isolated mode, without a shell, so nothing a session or a project sets reaches it.
+
+Scheduled jobs that run Claude (a nightly check, an Agent SDK job) wait for a pass too. To remove it: `/seal:off` shows the `sudo` command.
 
 ## Lost your phone?
 
@@ -67,9 +85,10 @@ When git wants a signature, the request goes on the clipboard (with a notice on 
 - While a pass is good, sessions work as usual, with Claude's own permission questions.
 - A pass, a yes to one command, a commit signature and a yes to turning the lock off are four different purposes. A signature made for one never counts as another, and a yes counts once.
 - If the lock breaks or can't start while it's on, it holds (`"onFailure": "block"`). While it's off, it doesn't start Python at all.
-- The lock's files (`~/.seal-gate`) belong to your user account. While a pass is good, an agent determined to remove the lock could. A version with its rules in an admin-owned file, which no agent can change, is planned.
+- Without lockdown, the switch and the key live in your own files (`~/.seal-gate`): while a pass is good, an agent determined to remove the lock could, and a project's settings could switch the plugin off. With lockdown, neither can.
+- Even in lockdown, a pass opens the Mac for its length: an agent with tools could start a program of its own that keeps running after the pass ends. The lock holds Claude Code sessions, not every program on the Mac. Keep passes short.
 - A command typed with `!` at the Mac's own keyboard runs without hooks. Whoever sits at your keyboard can open Terminal anyway; from the phone, a `!` line arrives as a plain message, and is held.
-- A session started with your settings left out (`claude --setting-sources ""`) isn't under the lock. That is how a scheduled job stays out of it. The lock keeps your agents from being driven by someone else; it doesn't stop someone who can already run commands on your Mac.
+- Without lockdown, a session started with your settings left out (`claude --setting-sources ""`) isn't under the lock. That is how a scheduled job stays out of it. The lock keeps your agents from being driven by someone else; it doesn't stop someone who can already run commands on your Mac.
 - It talks to no network. Signatures are checked by the Mac's own `ssh-keygen`.
 
 ## Without the plugin

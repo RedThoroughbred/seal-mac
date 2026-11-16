@@ -86,6 +86,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
@@ -120,6 +121,55 @@ BEGIN, END = "-----BEGIN SSH SIGNATURE-----", "-----END SSH SIGNATURE-----"
 # No signature the phone makes comes near this many letters.
 LONGEST_SIGNATURE = 8192
 PARTS = ("", "pending", "used", "pass", os.path.join("pass", "ended"))
+
+
+# Lockdown: the lock installed by `seal-lockdown` (run with sudo) into Claude Code's admin-owned
+# settings, which no user, project or local setting can switch off. Its files live here, owned by root.
+# The tests point it elsewhere for the user-run commands. The hooks never take it from the surroundings:
+# seal-hook checks the fixed path, and the lockdown's own hook gets it as an argument.
+LOCKDOWN_ROOT = os.environ.get("SEAL_LOCKDOWN_ROOT", "/Library/Application Support/Seal")
+MANAGED_SETTINGS = "/Library/Application Support/ClaudeCode/managed-settings.json"
+LOCKDOWN = False
+
+
+def own_home():
+    """The home folder the system says this user has: not $HOME, which a project's settings could change."""
+    import pwd
+    return pwd.getpwuid(os.getuid()).pw_dir
+
+
+def harden(lockdown_root=None, state=None, copy=None, paste=None):
+    """For the hooks: take nothing from the surroundings. A project's settings can set environment
+    variables for a session, and with them once pointed the lock at an empty folder (security review
+    H1). The hook then uses the system's own tools, the user's real home and fixed times. In lockdown
+    the phone's key is read from the root-owned folder, and the lock is on whatever any file says."""
+    global FOLDER, SSH_KEYGEN, COPY, PASTE, GOOD_FOR, PASS_AT_MOST, SIGNERS, LOCKDOWN, LOCKDOWN_ROOT
+    FOLDER = state or os.path.join(own_home(), ".seal-gate")
+    SSH_KEYGEN = "/usr/bin/ssh-keygen"
+    COPY = copy or "/usr/bin/pbcopy"
+    PASTE = paste or "/usr/bin/pbpaste"
+    GOOD_FOR = 300
+    PASS_AT_MOST = PASS_LONGEST
+    if lockdown_root is not None:
+        LOCKDOWN = True
+        LOCKDOWN_ROOT = lockdown_root
+        SIGNERS = os.path.join(lockdown_root, "allowed_signers")
+    else:
+        LOCKDOWN_ROOT = "/Library/Application Support/Seal"
+
+
+def lockdown_installed():
+    return os.path.exists(os.path.join(LOCKDOWN_ROOT, "lockdown.json"))
+
+
+def lockdown_problem():
+    """Why the lockdown's key can't be trusted, in words. None when it can: the key file and its folder
+    must be there and not writable by this user (they belong to root)."""
+    if not os.path.isfile(SIGNERS or ""):
+        return "the lockdown has no phone key"
+    if os.access(SIGNERS, os.W_OK) or os.access(os.path.dirname(SIGNERS), os.W_OK):
+        return "the lockdown's files can be changed by this user, so they prove nothing"
+    return None
 
 
 class Refused(Exception):
@@ -165,8 +215,19 @@ def kept(path):
     return found if isinstance(found, dict) else None
 
 
+# In lockdown the phone's key lives in a folder only an admin can change (see `harden`).
+SIGNERS = None
+
+
 def allowed_signers():
-    return folder("allowed_signers")
+    return SIGNERS or folder("allowed_signers")
+
+
+def until_of(found):
+    """The "until" a kept file names, when it is a number. 0 otherwise: a damaged file counts as past its
+    time and is let go of, instead of stopping the lock from asking (security review L2)."""
+    value = found.get("until") if isinstance(found, dict) else None
+    return value if type(value) in (int, float) else 0
 
 
 def purposes():
@@ -250,7 +311,7 @@ def read_pending(command, where):
             waiting = json.load(handle)
     except (OSError, ValueError):
         return None
-    if waiting.get("command") != command or waiting.get("in") != where or time.time() >= waiting.get("until", 0):
+    if not isinstance(waiting, dict) or waiting.get("command") != command or waiting.get("in") != where or time.time() >= until_of(waiting):
         try:
             os.unlink(path)
         except OSError:
@@ -265,11 +326,7 @@ def sweep():
     for part in ("pending", "used", os.path.join("pass", "ended")):
         for name in os.listdir(folder(part)):
             path = folder(part, name)
-            try:
-                with open(path) as handle:
-                    until = json.load(handle).get("until", 0)
-            except (OSError, ValueError, AttributeError):
-                until = 0
+            until = until_of(kept(path))
             if now >= until + 3600:
                 try:
                     os.unlink(path)
@@ -688,10 +745,28 @@ def lock(event):
     return 2
 
 
-def hook():
+def hook(options=()):
     """What an agent's hooks call before a message is taken and before a tool runs. 0 lets it go on to
-    the agent's own rules, 2 holds it. Whatever goes wrong in here holds."""
+    the agent's own rules, 2 holds it. Whatever goes wrong in here holds.
+
+    --hardened                      the plugin's hook: nothing taken from the surroundings
+    --lockdown [--root DIR] [--state DIR] [--copy CMD --paste CMD]
+                                    the admin-owned hook: always on; the paths come only from these
+                                    arguments, which live in a root-owned file"""
     try:
+        options = list(options)
+        if "--lockdown" in options:
+            def given(flag):
+                return options[options.index(flag) + 1] if flag in options[:-1] else None
+            harden(lockdown_root=given("--root") or LOCKDOWN_ROOT, state=given("--state"),
+                   copy=given("--copy"), paste=given("--paste"))
+            problem = lockdown_problem()
+            if problem is not None:
+                say(f"Seal lock: agent sessions on this Mac are locked down, and {problem}. Nothing runs. "
+                    "In Terminal: sudo sh \"<the plugin>/bin/seal-lockdown\" status")
+                return 2
+        elif "--hardened" in options:
+            harden()
         try:
             event = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace"))
         except ValueError:
@@ -750,6 +825,11 @@ def passes(arguments):
 
 
 def setup(key_line):
+    # Whoever could pair a key of their own could sign their own passes: never while the lock is on, by
+    # this road or /seal:pair (security review M2).
+    if lock_is_on():
+        say("seal-gate: the lock is on, so no new phone key is taken. Turn the lock off first (with your phone), then pair.")
+        return 1
     key_line = " ".join(key_line.split())
     if "PRIVATE" in key_line:
         say("seal-gate: that is a private key. It was not kept. The public key line starts with ecdsa-sha2-nistp256 or ssh-ed25519.")
@@ -796,12 +876,8 @@ def status():
         say(f"seal-gate: a request for a pass waits for the phone's answer until {clock(min(asked[1], asked[0] + GOOD_FOR))}.")
     waiting = []
     for name in sorted(os.listdir(folder("pending"))):
-        try:
-            with open(folder("pending", name)) as handle:
-                item = json.load(handle)
-        except (OSError, ValueError):
-            continue
-        if time.time() < item.get("until", 0):
+        item = kept(folder("pending", name))
+        if item is not None and time.time() < until_of(item):
             waiting.append(item)
     if not waiting:
         say("seal-gate: nothing is waiting for a yes.")
@@ -837,7 +913,7 @@ OFF_WORDS = "Turn the Seal lock off"
 OFF_WHY = "someone typed /seal:off"
 # The plugin's commands a held message may still be, typed alone. None of them opens anything:
 # /seal:off only asks the phone, and the lock goes off on the phone's yes alone.
-LET_THROUGH = re.compile(r"/seal:(status|on|off|drop|pass(\s+\d{1,3})?)")
+LET_THROUGH = re.compile(r"/seal:(status|on|off|drop|lockdown|pass(\s+\d{1,3})?)")
 KEY_KINDS = ("ecdsa-sha2-nistp256 ", "ssh-ed25519 ")
 
 
@@ -847,7 +923,7 @@ def switch():
 
 
 def lock_is_on():
-    return os.path.lexists(switch())
+    return LOCKDOWN or lockdown_installed() or os.path.lexists(switch())
 
 
 def switch_off():
@@ -872,7 +948,10 @@ def phone_key_line():
 
 
 def off_by_message(said):
-    """A yes from the phone to turning the lock off, pasted into a message. True when it switched it off."""
+    """A yes from the phone to turning the lock off, pasted into a message. True when it switched it off.
+    Never in lockdown: that takes the Mac's admin password."""
+    if LOCKDOWN or lockdown_installed():
+        return False
     if not lock_is_on() or read_pending(OFF_WORDS, off_where()) is None:
         return False
     if check(OFF_WORDS, off_where(), text=said, quiet=True) != 0:
@@ -881,7 +960,14 @@ def off_by_message(said):
     return True
 
 
+def lockdown_tool():
+    return os.path.join(os.path.dirname(os.path.realpath(__file__)), "seal-lockdown")
+
+
 def turn_on():
+    if lockdown_installed():
+        say("Seal: lockdown is on, so the lock is always on. /seal:status shows where it stands.")
+        return 0
     why = no_pass_possible()
     if why is not None:
         say(f"Seal: the lock was not turned on: {why}")
@@ -905,6 +991,11 @@ def turn_on():
 def turn_off(text=None):
     """The lock goes off only on a yes signed by the phone for exactly that, taken from the clipboard (or
     from text). Without one it asks, and the request waits five minutes for the answer."""
+    if lockdown_installed():
+        say("Seal: lockdown is on. Turning it off takes your Mac's password, so no agent can. In Terminal:")
+        say()
+        say(f'sudo sh "{lockdown_tool()}" remove')
+        return 0
     if not lock_is_on():
         say("Seal: the lock is already off. /seal:on turns it on.")
         return 0
@@ -933,6 +1024,11 @@ def turn_off(text=None):
 def pair(text=None):
     """Keeps the phone's public key, from the clipboard unless given. Never while the lock is on: whoever
     could pair a key of their own could sign their own passes."""
+    if lockdown_installed():
+        say("Seal: lockdown is on, so a new phone key goes in with your Mac's password. Copy the key on the phone, then in Terminal:")
+        say()
+        say(f'sudo sh "{lockdown_tool()}" pair "$(pbpaste)"')
+        return 1
     if lock_is_on():
         say("Seal: the lock is on, so no new phone key is taken. Turn the lock off first (/seal:off, with your phone), then pair.")
         return 1
@@ -994,8 +1090,16 @@ def lock_status():
     """Where everything stands, in the chat's words."""
     with turn():
         sweep()
-    if lock_is_on():
+    if lockdown_installed():
+        say("Seal: LOCKDOWN is on. Every Claude Code session on this Mac waits for a pass from your phone, and no "
+            "project setting can switch that off. Removing it takes your Mac's password.")
+        harden(lockdown_root=LOCKDOWN_ROOT)
+        problem = lockdown_problem()
+        if problem is not None:
+            say(f"Problem: {problem}.")
+    elif lock_is_on():
         say("Seal: the lock is ON. Claude Code sessions with the Seal plugin wait for a pass from your phone.")
+        say("A project's settings could still switch this off. /seal:lockdown makes it hold against that.")
     else:
         say("Seal: the lock is off. /seal:on turns it on.")
     line, allowed = phone_key_line(), purposes()
@@ -1012,9 +1116,87 @@ def lock_status():
         say(f"Waiting for your phone: a pass, until {clock(min(asked[1], asked[0] + GOOD_FOR))}.")
     for name in sorted(os.listdir(folder("pending"))):
         item = kept(folder("pending", name))
-        if item is not None and time.time() < item.get("until", 0):
+        if item is not None and time.time() < until_of(item):
             say(f"Waiting for your phone: a yes to \"{item.get('command')}\", until {clock(item['until'])}.")
     return 0
+
+
+def lockdown_help():
+    if lockdown_installed():
+        say("Seal: lockdown is already on. To remove it (your Mac's password), in Terminal:")
+        say()
+        say(f'sudo sh "{lockdown_tool()}" remove')
+        return 0
+    if no_pass_possible() is not None:
+        say("Seal: pair your phone first (/seal:pair). Lockdown takes the key that is paired.")
+        return 1
+    say("Seal: lockdown puts the lock in Claude Code's admin-owned settings. Then:")
+    say("- every Claude Code session on this Mac waits for a pass from your phone, this one too;")
+    say("- no project, local or user setting can switch it off (a plain /seal:on can be);")
+    say("- removing it, or pairing another phone, takes your Mac's password, which no agent has;")
+    say("- scheduled jobs that run Claude (a nightly check, an agent job) wait for a pass too.")
+    say()
+    say("To turn it on, open the Terminal app (not Claude) and paste this. It shows your phone key's fingerprint and asks before it changes anything:")
+    say()
+    say(f'sudo sh "{lockdown_tool()}" install')
+    return 0
+
+
+def lockdown_entry(gate, root):
+    """The hook the lockdown puts in Claude Code's admin-owned settings. Run with `args`, so no shell
+    takes part, with an empty environment and Python in isolated mode: nothing from the session or
+    a project's settings reaches it."""
+    return {
+        "type": "command",
+        "command": "/usr/bin/env",
+        "args": ["-i", "LANG=en_US.UTF-8", "/usr/bin/python3", "-I", gate, "hook", "--lockdown", "--root", root],
+        "timeout": 30,
+        "onFailure": "block",
+    }
+
+
+def is_ours(entry, gate):
+    return isinstance(entry, dict) and entry.get("command") == "/usr/bin/env" and gate in (entry.get("args") or [])
+
+
+def managed(verb, path, gate, root):
+    """Adds the lockdown's two hooks to Claude Code's managed settings file, or takes them out again,
+    leaving everything else in the file as it was. Used by seal-lockdown, as root."""
+    found = {}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as handle:
+            found = json.load(handle)
+        if not isinstance(found, dict):
+            raise Refused(f"{path} is not a settings object; nothing was changed")
+    hooks = found.get("hooks") or {}
+    if not isinstance(hooks, dict):
+        raise Refused(f"the hooks in {path} are not an object; nothing was changed")
+    for event in ("UserPromptSubmit", "PreToolUse"):
+        groups = [group for group in (hooks.get(event) or [])
+                  if not (isinstance(group, dict) and any(is_ours(each, gate) for each in group.get("hooks") or []))]
+        if verb == "add":
+            group = {"hooks": [lockdown_entry(gate, root)]}
+            if event == "PreToolUse":
+                group = {"matcher": "*", **group}
+            groups.append(group)
+        if groups:
+            hooks[event] = groups
+        else:
+            hooks.pop(event, None)
+    if hooks:
+        found["hooks"] = hooks
+    else:
+        found.pop("hooks", None)
+    if not found:
+        if os.path.exists(path):
+            os.unlink(path)
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".part", "w", encoding="utf-8") as handle:
+        json.dump(found, handle, indent=2)
+        handle.write("\n")
+    os.chmod(path + ".part", 0o644)
+    os.replace(path + ".part", path)
 
 
 def slash(arguments):
@@ -1034,6 +1216,8 @@ def slash(arguments):
         return pair()
     if verb == "git" and not rest:
         return git_here()
+    if verb == "lockdown" and not rest:
+        return lockdown_help()
     if verb == "pass" and len(rest) <= 1:
         try:
             minutes = int(rest[0]) if rest else PASS_USUAL // 60
@@ -1043,7 +1227,7 @@ def slash(arguments):
             say("Seal: /seal:pass takes a number of minutes, like /seal:pass 120.")
             return 2
         return pass_ask(minutes * 60)
-    say("Seal: the commands are /seal:status, /seal:pair, /seal:on, /seal:off, /seal:pass [minutes], /seal:drop and /seal:git.")
+    say("Seal: the commands are /seal:status, /seal:pair, /seal:on, /seal:off, /seal:pass [minutes], /seal:drop, /seal:git and /seal:lockdown.")
     return 2
 
 
@@ -1053,6 +1237,13 @@ def main(arguments):
         return 0
     if arguments[0] == "slash":
         return slash(arguments[1:])
+    if arguments[0] == "managed" and len(arguments) == 5 and arguments[1] in ("add", "remove"):
+        try:
+            managed(arguments[1], arguments[2], arguments[3], arguments[4])
+        except (Refused, OSError, ValueError) as no:
+            say(f"seal-gate: {no}")
+            return 1
+        return 0
     if arguments[0] == "on" and len(arguments) == 1:
         return turn_on()
     if arguments[0] == "off" and len(arguments) == 1:
@@ -1067,15 +1258,20 @@ def main(arguments):
         return status()
     if arguments[0] == "try":
         return by_hand()
-    if arguments[0] == "hook" and len(arguments) == 1:
-        return hook()
+    if arguments[0] == "hook":
+        return hook(arguments[1:])
     if arguments[0] == "settings" and len(arguments) == 1:
         return settings()
     if arguments[0] == "pass" and len(arguments) >= 2:
         return passes(arguments[1:])
     if arguments[0] in ("ask", "check") and "--" in arguments:
         split = arguments.index("--")
-        options, command = arguments[1:split], " ".join(arguments[split + 1:])
+        # The command as a shell would read it (security review L1). Given as one argument, it is that
+        # text exactly, the way a guard hands over the command it held. Given as several words, each is
+        # quoted where it needs to be, so `-- echo "a b"` and `-- echo a b` are two different commands,
+        # and so two different requests.
+        words = arguments[split + 1:]
+        options, command = arguments[1:split], words[0] if len(words) == 1 else shlex.join(words)
         where = os.getcwd()
         why = "it was held"
         index = 0
